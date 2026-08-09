@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+duobit.egg-info/
+build/
+dist/
+*.so
+.DS_Store
