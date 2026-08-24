@@ -3,11 +3,12 @@ from dataclasses import dataclass
 
 @dataclass
 class DuobitConfig:
-    """DUOBIT-EST v3 configuration.
+    """DUOBIT-EST configuration.
 
-    Persistent weight storage is discrete codes + per-group scales.
-    Optimizer states (Adam moments, PEFA residual) are training-only and
-    discarded at inference — there is no FP32 master-weight tensor.
+    Persistent weight storage is discrete codes plus per-group scales.
+    The training residual (QPEFA) and Adam moments are integer / factored
+    optimizer state, discarded at inference. There is no FP32 master-weight
+    tensor at any point.
     """
 
     # Codebook
@@ -19,6 +20,7 @@ class DuobitConfig:
     # Quantization / precision
     activation_bits: int = 16  # 8 for W2A8, 16 for W2A16
     weight_bits: int = 2  # informational; derived from n_levels if needed
+    quant_mode: str = "duobit"  # duobit | fp32 | ste
 
     # Optimizer
     lr: float = 1e-3
@@ -28,13 +30,20 @@ class DuobitConfig:
     eps: float = 1e-8
     weight_decay: float = 0.01
 
-    # Error compensation, PEFA, trust gating
-    enable_error_compensation: bool = True
-    use_pefa: bool = True  # v3: persistent error-feedback accumulator
-    pefa_clip: float = 8.0  # clip residual relative to group scale
+    # Error feedback
+    enable_error_compensation: bool = False
+    use_pefa: bool = True
+    pefa_clip: float = 4.0
+    qpefa_bits: int = 8
+    qpefa_stochastic: bool = True
     trust_threshold: float = 4.0
     balanced_rounding: bool = True
     use_mse_scales: bool = True
+
+    # Compressed optimizer state
+    moment_bits: int = 8
+    factored_second_moment: bool = True
+    block_size: int = 128
 
     # Transition dynamics
     transition_temperature: float = 0.8

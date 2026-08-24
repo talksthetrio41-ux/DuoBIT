@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -6,11 +6,22 @@ import torch.nn.functional as F
 
 from duobit.config import DuobitConfig
 from duobit.layers.duobit_linear import DuobitLinear
+from duobit.layers.ste_linear import SteQuantLinear
 from duobit.model.utils import RMSNorm, RotaryEmbedding, apply_rotary_pos_emb
 
 
-def _linear_factory(config: DuobitConfig, use_duobit: bool, use_hadamard: Optional[bool] = None):
+def _linear_factory(config: DuobitConfig, use_duobit: Union[bool, str], use_hadamard: Optional[bool] = None):
     had = config.use_hadamard if use_hadamard is None else use_hadamard
+    mode = config.quant_mode
+    if use_duobit == "ste" or mode == "ste":
+        return lambda in_f, out_f: SteQuantLinear(
+            in_f,
+            out_f,
+            group_size=config.group_size,
+            rho=config.rho,
+            n_levels=config.resolved_n_levels(),
+            bias=False,
+        )
     if use_duobit:
         return lambda in_f, out_f: DuobitLinear(
             in_f,
@@ -26,7 +37,7 @@ def _linear_factory(config: DuobitConfig, use_duobit: bool, use_hadamard: Option
 
 
 class DuobitAttention(nn.Module):
-    def __init__(self, config: DuobitConfig, use_duobit: bool = True):
+    def __init__(self, config: DuobitConfig, use_duobit: Union[bool, str] = True):
         super().__init__()
         self.d_model = config.d_model
         self.n_heads = config.n_heads
@@ -51,7 +62,7 @@ class DuobitAttention(nn.Module):
 
 
 class DuobitFFN(nn.Module):
-    def __init__(self, config: DuobitConfig, use_duobit: bool = True):
+    def __init__(self, config: DuobitConfig, use_duobit: Union[bool, str] = True):
         super().__init__()
         self.use_swiglu = config.use_swiglu
         linear_cls = _linear_factory(config, use_duobit)
@@ -72,7 +83,7 @@ class DuobitFFN(nn.Module):
 
 
 class DuobitTransformerBlock(nn.Module):
-    def __init__(self, config: DuobitConfig, use_duobit: bool = True):
+    def __init__(self, config: DuobitConfig, use_duobit: Union[bool, str] = True):
         super().__init__()
         self.norm1 = RMSNorm(config.d_model)
         self.attn = DuobitAttention(config, use_duobit=use_duobit)
@@ -86,11 +97,15 @@ class DuobitTransformerBlock(nn.Module):
 
 
 class DuobitTransformer(nn.Module):
-    """GPT-style decoder with DuobitLinear (or dense Linear for FP32 baselines)."""
+    """GPT-style decoder with DuobitLinear, STE latent weights, or dense Linear."""
 
-    def __init__(self, config: DuobitConfig, use_duobit: bool = True):
+    def __init__(self, config: DuobitConfig, use_duobit: Union[bool, str] = True):
         super().__init__()
         self.config = config
+        if config.quant_mode == "ste":
+            use_duobit = "ste"
+        elif config.quant_mode == "fp32":
+            use_duobit = False
         self.use_duobit = use_duobit
         self.gradient_checkpointing = config.gradient_checkpointing
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.d_model)
@@ -124,6 +139,10 @@ class DuobitTransformer(nn.Module):
         for m in self.modules():
             if isinstance(m, DuobitLinear):
                 n += m.codes.numel()
+                if m.bias is not None:
+                    n += m.bias.numel()
+            elif isinstance(m, SteQuantLinear):
+                n += m.weight.numel()
                 if m.bias is not None:
                     n += m.bias.numel()
             elif isinstance(m, (nn.Linear, nn.Embedding, RMSNorm)):

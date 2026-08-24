@@ -5,7 +5,9 @@ import torch
 from torch.optim import Optimizer
 
 from duobit.layers.duobit_linear import DuobitLinear
+from duobit.quantization.blockwise import dequantize_blockwise, quantize_blockwise
 from duobit.quantization.codebook import compute_group_scales, compute_mse_group_scales
+from duobit.quantization.qpefa import dequantize_residual, quantize_residual
 from duobit.quantization.stochastic import (
     balanced_stochastic_round,
     compute_transition_probs,
@@ -14,17 +16,20 @@ from duobit.quantization.stochastic import (
 
 
 class DuobitAdam(Optimizer):
-    """DUOBIT-EST optimizer (v3).
+    """DUOBIT-EST optimizer.
 
-    Discrete codes are updated from an Adam candidate step. v3 adds PEFA:
-    a persistent error-feedback residual `e` (optimizer state, not a weight)
-    so sub-threshold updates accumulate until they cross a codebook gap.
+    Discrete codes are updated from an Adam candidate step. Sub-threshold
+    updates accumulate in a quantized error-feedback residual (QPEFA) until
+    they cross a codebook gap. First-moment tensors are stored block-wise in
+    integer format. The second moment is factored into row and column
+    statistics by default (Adafactor-style), so it is O(m+n) rather than O(mn).
 
         e ← e + (W̃ − W_t)
         z, W_{t+1}, e ← Quantize(W_t + e)
+        store e as an integer residual relative to the group scale
 
-    Inference checkpoints store only (codes, scales). `e`, `m`, and `v`
-    are discarded.
+    Inference checkpoints store only (codes, scales). The residual and the
+    Adam moments are discarded.
     """
 
     def __init__(
@@ -36,7 +41,7 @@ class DuobitAdam(Optimizer):
         eps: float = 1e-8,
         weight_decay: float = 0.01,
         trust_threshold: float = 4.0,
-        enable_error_compensation: bool = True,
+        enable_error_compensation: bool = False,
         balanced_rounding: bool = True,
         use_mse_scales: bool = True,
         scale_update_freq: int = 50,
@@ -45,7 +50,12 @@ class DuobitAdam(Optimizer):
         min_transitions_per_group: int = 0,
         use_raw_momentum: bool = False,
         use_pefa: bool = True,
-        pefa_clip: float = 8.0,
+        pefa_clip: float = 4.0,
+        qpefa_bits: int = 8,
+        qpefa_stochastic: bool = True,
+        moment_bits: int = 8,
+        factored_second_moment: bool = True,
+        block_size: int = 128,
     ):
         self.duobit_lr = duobit_lr if duobit_lr is not None else lr
         defaults = dict(
@@ -66,6 +76,11 @@ class DuobitAdam(Optimizer):
             use_raw_momentum=use_raw_momentum,
             use_pefa=use_pefa,
             pefa_clip=pefa_clip,
+            qpefa_bits=qpefa_bits,
+            qpefa_stochastic=qpefa_stochastic,
+            moment_bits=moment_bits,
+            factored_second_moment=factored_second_moment,
+            block_size=block_size,
         )
 
         params = [p for p in model.parameters() if p.requires_grad]
@@ -80,6 +95,14 @@ class DuobitAdam(Optimizer):
         ]
         self.step_count = 0
         self.last_transition_frac = 0.0
+
+    def clip_ephemeral_grads(self, max_norm: float = 1.0) -> None:
+        tensors = []
+        for layer in self.duobit_layers:
+            if layer.ephemeral_w is not None and layer.ephemeral_w.grad is not None:
+                tensors.append(layer.ephemeral_w.grad)
+        if tensors:
+            torch.nn.utils.clip_grad_norm_(tensors, max_norm)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -130,6 +153,111 @@ class DuobitAdam(Optimizer):
                 if p.numel() == 1 and hasattr(p, "_is_rho"):
                     p.data.clamp_(0.1, 0.9)
 
+    def _load_first_moment(self, state, like: torch.Tensor, bits: int, block_size: int):
+        if bits >= 16:
+            if "exp_avg" not in state:
+                state["exp_avg"] = torch.zeros_like(like, dtype=torch.float32)
+            return state["exp_avg"]
+        if "exp_avg_q" not in state:
+            q, scale, shape, pad = quantize_blockwise(
+                torch.zeros_like(like, dtype=torch.float32), bits=bits, block_size=block_size
+            )
+            state["exp_avg_q"] = q
+            state["exp_avg_scale"] = scale
+            state["exp_avg_shape"] = shape
+            state["exp_avg_pad"] = pad
+        return dequantize_blockwise(
+            state["exp_avg_q"],
+            state["exp_avg_scale"],
+            state["exp_avg_shape"],
+            state["exp_avg_pad"],
+            dtype=torch.float32,
+        )
+
+    def _store_first_moment(self, state, m: torch.Tensor, bits: int, block_size: int):
+        if bits >= 16:
+            state["exp_avg"].copy_(m)
+            return
+        q, scale, shape, pad = quantize_blockwise(m, bits=bits, block_size=block_size)
+        state["exp_avg_q"] = q
+        state["exp_avg_scale"] = scale
+        state["exp_avg_shape"] = shape
+        state["exp_avg_pad"] = pad
+
+    def _load_second_moment(
+        self,
+        state,
+        like: torch.Tensor,
+        bits: int,
+        block_size: int,
+        factored: bool,
+    ):
+        if factored:
+            if "v_row" not in state:
+                state["v_row"] = torch.zeros(like.shape[0], dtype=torch.float32, device=like.device)
+                state["v_col"] = torch.zeros(like.shape[1], dtype=torch.float32, device=like.device)
+            return None
+        if bits >= 16:
+            if "exp_avg_sq" not in state:
+                state["exp_avg_sq"] = torch.zeros_like(like, dtype=torch.float32)
+            return state["exp_avg_sq"]
+        if "exp_avg_sq_q" not in state:
+            q, scale, shape, pad = quantize_blockwise(
+                torch.zeros_like(like, dtype=torch.float32), bits=bits, block_size=block_size
+            )
+            state["exp_avg_sq_q"] = q
+            state["exp_avg_sq_scale"] = scale
+            state["exp_avg_sq_shape"] = shape
+            state["exp_avg_sq_pad"] = pad
+        return dequantize_blockwise(
+            state["exp_avg_sq_q"],
+            state["exp_avg_sq_scale"],
+            state["exp_avg_sq_shape"],
+            state["exp_avg_sq_pad"],
+            dtype=torch.float32,
+        )
+
+    def _store_second_moment(self, state, v: torch.Tensor, bits: int, block_size: int, factored: bool):
+        if factored:
+            return
+        if bits >= 16:
+            state["exp_avg_sq"].copy_(v)
+            return
+        q, scale, shape, pad = quantize_blockwise(v, bits=bits, block_size=block_size)
+        state["exp_avg_sq_q"] = q
+        state["exp_avg_sq_scale"] = scale
+        state["exp_avg_sq_shape"] = shape
+        state["exp_avg_sq_pad"] = pad
+
+    def _load_error(self, state, layer: DuobitLinear, bits: int, pefa_clip: float):
+        if bits >= 16:
+            if "error" not in state:
+                state["error"] = torch.zeros(
+                    layer.codes.shape, dtype=torch.float32, device=layer.codes.device
+                )
+            return state["error"]
+        if "error_q" not in state:
+            state["error_q"] = torch.zeros(
+                layer.codes.shape, dtype=torch.int8, device=layer.codes.device
+            )
+        return dequantize_residual(state["error_q"], layer.scales, bits, pefa_clip)
+
+    def _store_error(
+        self,
+        state,
+        err: torch.Tensor,
+        layer: DuobitLinear,
+        bits: int,
+        pefa_clip: float,
+        stochastic: bool,
+    ):
+        if bits >= 16:
+            state["error"].copy_(err)
+            return
+        state["error_q"] = quantize_residual(
+            err, layer.scales, bits, pefa_clip, stochastic=stochastic
+        )
+
     def _step_duobit_layers(self):
         changed = 0
         total = 0
@@ -156,31 +284,43 @@ class DuobitAdam(Optimizer):
             min_k = group_defaults.get("min_transitions_per_group", 0)
             use_raw_mom = group_defaults.get("use_raw_momentum", False)
             use_pefa = group_defaults.get("use_pefa", True)
-            pefa_clip = group_defaults.get("pefa_clip", 8.0)
+            pefa_clip = group_defaults.get("pefa_clip", 4.0)
+            qpefa_bits = int(group_defaults.get("qpefa_bits", 8))
+            qpefa_stoch = bool(group_defaults.get("qpefa_stochastic", True))
+            moment_bits = int(group_defaults.get("moment_bits", 8))
+            factored = bool(group_defaults.get("factored_second_moment", True))
+            block_size = int(group_defaults.get("block_size", 128))
 
-            if len(state) == 0:
+            if "step" not in state:
                 state["step"] = 0
-                state["exp_avg"] = torch.zeros_like(layer.codes, dtype=torch.float32)
-                state["exp_avg_sq"] = torch.zeros_like(layer.codes, dtype=torch.float32)
-                state["error"] = torch.zeros_like(layer.codes, dtype=torch.float32)
 
-            if "error" not in state:
-                state["error"] = torch.zeros_like(layer.codes, dtype=torch.float32)
-
-            exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
             state["step"] += 1
             step_t = state["step"]
 
             w_curr = layer.get_dequantized_weight()
             prev_codes = layer.codes.clone()
 
-            exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
-            exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+            m = self._load_first_moment(state, w_curr, moment_bits, block_size)
+            v = self._load_second_moment(state, w_curr, moment_bits, block_size, factored)
+
+            m.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+
+            if factored:
+                g2 = grad * grad
+                state["v_row"].mul_(beta2).add_(g2.mean(dim=1), alpha=1.0 - beta2)
+                state["v_col"].mul_(beta2).add_(g2.mean(dim=0), alpha=1.0 - beta2)
+                row = state["v_row"].clamp(min=0)
+                col = state["v_col"].clamp(min=0)
+                denom_mean = row.mean().clamp(min=eps)
+                v_hat = torch.outer(row, col) / denom_mean
+            else:
+                v.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+                v_hat = v
 
             bias_correction1 = 1.0 - beta1 ** step_t
             bias_correction2 = 1.0 - beta2 ** step_t
-            m_hat = exp_avg / bias_correction1
-            v_hat = exp_avg_sq / bias_correction2
+            m_hat = m / bias_correction1
+            v_hat = v_hat / bias_correction2
 
             if use_raw_mom:
                 step_direction = m_hat
@@ -194,22 +334,20 @@ class DuobitAdam(Optimizer):
             rho_val = layer.rho if isinstance(layer.rho, torch.nn.Parameter) else None
 
             if use_pefa:
-                err = state["error"]
-                err.add_(w_cand - w_curr)
-                # Clip residual relative to local scale so a single outlier
-                # cannot dominate, but several gaps of accumulation remain.
+                err = self._load_error(state, layer, qpefa_bits, pefa_clip)
+                err = err + (w_cand - w_curr)
                 if layer.scales.dim() == 3:
                     out_f, in_f = err.shape
                     n_groups = layer.scales.shape[1]
                     gsz = in_f // n_groups
                     max_res = (pefa_clip * layer.scales).expand(out_f, n_groups, gsz).reshape(out_f, in_f)
-                    err.clamp_(-max_res, max_res)
+                    err = err.clamp(-max_res, max_res)
                 w_virtual = w_curr + err
                 new_codes, w_new, new_err = quantize_with_residual(
                     w_virtual, layer.scales, layer.codebook, rho=rho_val
                 )
                 layer.codes.copy_(new_codes)
-                err.copy_(new_err)
+                self._store_error(state, new_err, layer, qpefa_bits, pefa_clip, qpefa_stoch)
             else:
                 probs, target_codes, _ = compute_transition_probs(
                     w_current=w_curr,
@@ -246,7 +384,11 @@ class DuobitAdam(Optimizer):
                 quant_residual = w_cand - w_new
                 rescaled_err = -quant_residual * (torch.sqrt(v_hat) + eps) / (d_lr + 1e-8)
                 rescaled_err = torch.clamp(rescaled_err, min=-1.0, max=1.0)
-                exp_avg.add_(rescaled_err)
+                m = m + rescaled_err
+
+            self._store_first_moment(state, m, moment_bits, block_size)
+            if not factored:
+                self._store_second_moment(state, v, moment_bits, block_size, factored)
 
             changed += int((layer.codes != prev_codes).sum().item())
             total += layer.codes.numel()

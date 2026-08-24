@@ -6,6 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from duobit.config import DuobitConfig
+from duobit.layers.duobit_linear import DuobitLinear
 from duobit.optim.duobit_adam import DuobitAdam
 from duobit.training.metrics import MetricTracker
 
@@ -47,6 +48,11 @@ class Trainer:
                 use_raw_momentum=config.use_raw_momentum,
                 use_pefa=config.use_pefa,
                 pefa_clip=config.pefa_clip,
+                qpefa_bits=config.qpefa_bits,
+                qpefa_stochastic=config.qpefa_stochastic,
+                moment_bits=config.moment_bits,
+                factored_second_moment=config.factored_second_moment,
+                block_size=config.block_size,
             )
         else:
             self.optimizer = optimizer
@@ -60,6 +66,18 @@ class Trainer:
         decay_ratio = min(1.0, max(0.0, decay_ratio))
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
         return self.config.lr * 0.1 + coeff * (self.config.lr * 0.9)
+
+    def _clip_grads(self):
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        if hasattr(self.optimizer, "clip_ephemeral_grads"):
+            self.optimizer.clip_ephemeral_grads(max_norm=1.0)
+        else:
+            ephemeral = []
+            for m in self.model.modules():
+                if isinstance(m, DuobitLinear) and m.ephemeral_w is not None and m.ephemeral_w.grad is not None:
+                    ephemeral.append(m.ephemeral_w.grad)
+            if ephemeral:
+                torch.nn.utils.clip_grad_norm_(ephemeral, max_norm=1.0)
 
     def train(self, max_steps: int, eval_freq: int = 50, warmup_steps: int = 50) -> Dict[str, Any]:
         self.model.train()
@@ -92,7 +110,7 @@ class Trainer:
             self.optimizer.zero_grad()
             _, loss = self.model(input_ids, targets=targets)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self._clip_grads()
             self.optimizer.step()
             step += 1
 

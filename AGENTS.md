@@ -1,17 +1,18 @@
-# DUOBIT-EST v3 — Architecture & Developer Guide
+# DUOBIT-EST: Architecture and Developer Guide
 
 **Author:** Pratyush Bhardwaj  
-**Version:** 0.3.0 (PEFA)
+**Version:** 1.0.0 (QPEFA + compressed Adam)
 
-Native 2-bit / ternary / binary pretraining **without master weights**. Linear maps persist as discrete codes $z$ and group scales $s$. Optimizer states (Adam $m,v$ and PEFA residual $e$) are training-only.
+Native 2-bit / ternary / binary pretraining **without master weights**. Linear maps persist as discrete codes $z$ and group scales $s$. The training residual is an integer QPEFA tensor. Adam $m$ is block-wise int8. Adam $v$ is factored ($O(m+n)$).
 
-## v3 headline
+## Headline
 
-v1 ECO injected quantization error into Adam momentum. Codes froze (transition rate → 0%). v3 stores a persistent error-feedback accumulator $e$ so virtual weights cross codebook gaps. Tiny-LM verification (94,528 params, 50 steps, CPU):
+On a 94,528-parameter decoder (50 steps, CPU):
 
-- 2-bit PEFA val 1.46 / PPL 4.29 / 100% grammar acc / 0.056 MB
-- FP32 val 2.52 / PPL 12.43 / 70% acc / 0.361 MB
-- v1 ECO-only val 3.31 / final flip rate 0.05%
+- 2-bit QPEFA-8 val 1.23 / PPL 3.41 / 100% grammar / 0.056 MB infer / 0.288 MB train / 20.3 linear train bits/wt
+- FP32 Adam val 2.52 / PPL 12.43 / 70% acc / 0.361 MB infer / 1.082 MB train / 96 bits/wt
+- Latent-weight STE val 2.83 / 40% acc / same memory as FP32
+- QPEFA-4 val 1.25 / 16.3 train bits/wt
 
 Paper: `paper/duobit_est.md`
 
@@ -21,20 +22,21 @@ $$w_i = s_g C[z_i], \quad C\in\{\{-1,+1\},\{-1,0,+1\},\{-1,-\rho,+\rho,+1\}\}$$
 
 $$s_g^\star = \frac{\sum w_i c_i}{\sum c_i^2+\varepsilon}$$
 
-PEFA: $e \leftarrow e+(\tilde W-\hat W)$; $(z,\hat W,e)\leftarrow Q(\hat W+e)$.
+QPEFA: $e \leftarrow e+(\tilde W-\hat W)$; $(z,\hat W,e)\leftarrow Q(\hat W+e)$; store $e$ as $\mathrm{SR}(e \cdot q_{\max}/(\lambda s_g))$ in 4 or 8 bits.
 
 ## Layout
 
 ```
 duobit/                 # PyTorch package
-  config.py             # DuobitConfig (use_pefa, n_levels, ...)
+  config.py             # DuobitConfig (qpefa_bits, moment_bits, ...)
   layers/duobit_linear.py
-  optim/duobit_adam.py  # PEFA + ECO
-  quantization/         # codebook, stochastic, hadamard, memory
+  layers/ste_linear.py  # latent-weight STE baseline
+  optim/duobit_adam.py  # QPEFA + compressed Adam
+  quantization/         # codebook, qpefa, blockwise, stochastic, memory
   model/transformer.py  # SwiGLU, RoPE, RMSNorm
   training/
-scripts/phase3_verify.py
-tests/                  # 15 tests
+scripts/run_experiments.py
+tests/                  # 20 tests
 paper/duobit_est.md
 ```
 
@@ -42,12 +44,12 @@ paper/duobit_est.md
 
 ```bash
 PYTHONPATH=. python3 -m pytest tests/ -v
-PYTHONPATH=. python3 scripts/phase3_verify.py
+PYTHONPATH=. python3 scripts/run_experiments.py
 ```
 
 ## Next
 
-1. PEFA at 5.25M+ on GPU
+1. QPEFA at 5.25M+ on GPU
 2. WikiText-2 / TinyStories
-3. Packed bit-serial GEMM
+3. Packed bit-serial GEMM (remove the ephemeral dequant tile)
 4. W2A4
