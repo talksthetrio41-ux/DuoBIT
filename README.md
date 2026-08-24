@@ -1,16 +1,42 @@
-# DUOBIT-EST: Error-Compensated Stochastic Transition Training
+# DUOBIT-EST v3
 
-DUOBIT-EST is a training framework designed to train Large Language Models natively in 2-bit precision without full-precision master weights.
+**Error-Compensated Stochastic Transition Training of Language Models at Two Bits and Below Without Master Weights**
 
-## Key Features
-- **Native 2-bit Weight Codes**: Weights represented as discrete 2-bit codes $z_i \in \{0, 1, 2, 3\}$ mapped through a symmetric 4-level codebook $C = \{-1, -\rho, +\rho, +1\}$ with group scales $s_g$.
-- **Latent-Free Optimizer**: Eliminates continuous master weight storage by injecting ephemeral quantization residuals directly into optimizer momentum (ECO-style error compensation).
-- **Balanced Stochastic Transitions**: Uses group-level dependent stochastic rounding to guarantee unbiased updates with low variance.
-- **Stabilizers**: Hadamard normalization to smooth activation/gradient distributions, and transition-trust gating to prevent noise-driven level flips.
+Pratyush Bhardwaj · Independent researcher, India · August 2026
 
-## Package Architecture
-- `duobit.quantization`: Symmetric codebooks, group scale computation, bit-serial decomposition, balanced stochastic rounding, and Hadamard transforms.
-- `duobit.layers`: `DuobitLinear` layer replacing standard `nn.Linear`.
-- `duobit.optim`: `DuobitAdam` optimizer implementing error-compensated momentum updates and stochastic weight code transitions.
-- `duobit.model`: GPT-style decoder Transformer built with `DuobitLinear` modules.
-- `duobit.training`: Trainer and evaluation utilities.
+Native 2-bit / ternary / binary pretraining **without a full-precision master-weight tensor**. Linear maps are stored as discrete codes `z` and per-group scales `s`. Version 3 adds a persistent error-feedback accumulator (PEFA) so codes actually flip during training.
+
+- Paper (markdown): [`paper/duobit_est.md`](paper/duobit_est.md)
+- Package: `duobit/` (PyTorch)
+- Verification: `scripts/phase3_verify.py`
+- Tests: `python3 -m pytest tests/ -v` (15 passing)
+
+## Install
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install pytest matplotlib
+PYTHONPATH=. python3 -m pytest tests/ -v
+PYTHONPATH=. python3 scripts/phase3_verify.py
+```
+
+## What v3 changes
+
+| | v1 | v3 |
+|---|---|---|
+| Persistent weights | 2-bit codes + scales | same, plus ternary / binary |
+| Residual | injected into Adam `m` (ECO) | **PEFA** tensor in optimizer state |
+| Transition rate | collapses to 0% | stays ~9–15% on the tiny LM |
+| Master FP32 `W` | none | none |
+
+## Tiny-run headline (CPU, 94,528 params, 50 steps)
+
+| Run | Val loss | PPL | Mean flip % | Packed MB | Grammar acc. |
+|---|---|---|---|---|---|
+| FP32 Adam | 2.52 | 12.43 | — | 0.361 | 70% |
+| DUOBIT v3 2-bit PEFA | **1.46** | **4.29** | 15.0 | **0.056** | **100%** |
+| DUOBIT v1 ECO only | 3.31 | 27.39 | 3.3 → 0.05 | 0.056 | 40% |
+| Ternary PEFA | 2.42 | 11.22 | 6.9 | 0.052 | 80% |
+| Binary PEFA | 3.08 | 21.80 | 1.0 | 0.046 | 30% |
+
+These are small-scale verification numbers, not 1B-parameter claims. See the paper.

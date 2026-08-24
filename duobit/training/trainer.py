@@ -1,13 +1,14 @@
-import time
 import math
+import time
+from typing import Any, Dict, Optional, Tuple, Union
+
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
-from typing import Optional, Dict, Any, Tuple, Union
 
 from duobit.config import DuobitConfig
 from duobit.optim.duobit_adam import DuobitAdam
 from duobit.training.metrics import MetricTracker
+
 
 class Trainer:
     def __init__(
@@ -44,10 +45,11 @@ class Trainer:
                 transition_temperature=config.transition_temperature,
                 min_transitions_per_group=config.min_transitions_per_group,
                 use_raw_momentum=config.use_raw_momentum,
+                use_pefa=config.use_pefa,
+                pefa_clip=config.pefa_clip,
             )
         else:
             self.optimizer = optimizer
-
 
         self.metric_tracker = MetricTracker(self.model)
 
@@ -63,7 +65,6 @@ class Trainer:
         self.model.train()
         step = 0
         data_iter = iter(self.train_dataloader)
-        
         start_time = time.time()
         train_logs = []
 
@@ -84,34 +85,30 @@ class Trainer:
                 input_ids = batch.to(self.device)
                 targets = input_ids
 
-            # LR schedule update
             lr = self._get_lr(step, max_steps, warmup_steps=warmup_steps)
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = lr
 
             self.optimizer.zero_grad()
-            logits, loss = self.model(input_ids, targets=targets)
+            _, loss = self.model(input_ids, targets=targets)
             loss.backward()
-
-            # Gradient clipping
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
             self.optimizer.step()
-
             step += 1
 
-            if step % 10 == 0 or step == max_steps:
+            if step % 5 == 0 or step == max_steps:
                 metrics = self.metric_tracker.compute_metrics(loss.item())
                 metrics["step"] = step
                 metrics["lr"] = lr
                 metrics["sec_per_step"] = (time.time() - start_time) / step
+                if hasattr(self.optimizer, "last_transition_frac"):
+                    metrics["transition_rate"] = self.optimizer.last_transition_frac
                 train_logs.append(metrics)
-
-                if step % 50 == 0 or step == max_steps:
+                if step % 25 == 0 or step == max_steps:
                     trans_rate = metrics.get("transition_rate", 0.0)
                     print(
                         f"Step {step}/{max_steps} | Loss: {loss.item():.4f} | "
-                        f"PPL: {metrics['perplexity']:.2f} | TransRate: {trans_rate*100:.2f}% | LR: {lr:.2e}"
+                        f"PPL: {metrics['perplexity']:.2f} | TransRate: {trans_rate*100:.3f}% | LR: {lr:.2e}"
                     )
 
             if eval_freq > 0 and (step % eval_freq == 0 or step == max_steps) and self.val_dataloader is not None:
@@ -125,7 +122,6 @@ class Trainer:
         self.model.eval()
         total_loss = 0.0
         total_batches = 0
-
         for batch in self.val_dataloader:
             if isinstance(batch, dict):
                 input_ids = batch["input_ids"].to(self.device)
@@ -136,11 +132,9 @@ class Trainer:
             else:
                 input_ids = batch.to(self.device)
                 targets = input_ids
-
             _, loss = self.model(input_ids, targets=targets)
             total_loss += loss.item()
             total_batches += 1
-
         self.model.train()
         avg_loss = total_loss / max(1, total_batches)
         ppl = math.exp(avg_loss) if avg_loss < 20 else float("inf")

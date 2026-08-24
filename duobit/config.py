@@ -1,46 +1,55 @@
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
+
 
 @dataclass
 class DuobitConfig:
-    # Codebook parameters
+    """DUOBIT-EST v3 configuration.
+
+    Persistent weight storage is discrete codes + per-group scales.
+    Optimizer states (Adam moments, PEFA residual) are training-only and
+    discarded at inference — there is no FP32 master-weight tensor.
+    """
+
+    # Codebook
     group_size: int = 128
     rho: float = 1.0 / 3.0
     learnable_rho: bool = False
-    
-    # Quantization / Precision
-    activation_bits: int = 8  # 8 for W2A8, 16 for W2A16, 4 for W2A4
-    weight_bits: int = 2
-    
-    # Optimizer / Stochastic transitions
+    n_levels: int = 4  # 2 = binary, 3 = ternary (~1.58-bit), 4 = 2-bit
+
+    # Quantization / precision
+    activation_bits: int = 16  # 8 for W2A8, 16 for W2A16
+    weight_bits: int = 2  # informational; derived from n_levels if needed
+
+    # Optimizer
     lr: float = 1e-3
-    duobit_lr: float = 5e-3  # Specialized higher LR for 2-bit weight code transitions
+    duobit_lr: float = 8e-3
     beta1: float = 0.9
     beta2: float = 0.999
     eps: float = 1e-8
     weight_decay: float = 0.01
-    
-    # Error compensation & Trust gating
+
+    # Error compensation, PEFA, trust gating
     enable_error_compensation: bool = True
-    trust_threshold: float = 2.0  # Gating threshold relative to grid step
+    use_pefa: bool = True  # v3: persistent error-feedback accumulator
+    pefa_clip: float = 8.0  # clip residual relative to group scale
+    trust_threshold: float = 4.0
     balanced_rounding: bool = True
     use_mse_scales: bool = True
-    
-    # Transition dynamics & scaling
-    transition_temperature: float = 1.0
+
+    # Transition dynamics
+    transition_temperature: float = 0.8
     min_transitions_per_group: int = 0
-    use_raw_momentum: bool = False  # Use Adam-rescaled steps by default
-    
-    # Hadamard & Stabilizers
+    use_raw_momentum: bool = False
+
+    # Hadamard & scale EMA
     use_hadamard: bool = False
-    scale_update_freq: int = 100  # Step frequency to update group scales
-    scale_ema_alpha: float = 0.01  # EMA rate for periodic scale updates
-    
-    # Architecture features
+    scale_update_freq: int = 50
+    scale_ema_alpha: float = 0.01
+
+    # Architecture
     use_swiglu: bool = True
     gradient_checkpointing: bool = False
-    
-    # Model architecture defaults
+
     vocab_size: int = 50257
     d_model: int = 256
     n_layers: int = 4
@@ -49,3 +58,17 @@ class DuobitConfig:
     max_seq_len: int = 512
     dropout: float = 0.0
 
+    def resolved_n_levels(self) -> int:
+        if self.n_levels in (2, 3, 4):
+            return self.n_levels
+        if self.weight_bits <= 1:
+            return 2
+        return 4
+
+    def bits_per_code(self) -> float:
+        n = self.resolved_n_levels()
+        if n == 2:
+            return 1.0
+        if n == 3:
+            return 1.58496250072  # log2(3)
+        return 2.0
