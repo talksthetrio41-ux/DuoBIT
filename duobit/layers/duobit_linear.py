@@ -9,6 +9,7 @@ from duobit.quantization.codebook import (
     SymmetricCodebook,
     compute_group_scales,
     compute_mse_group_scales,
+    compute_var_group_scales,
 )
 from duobit.quantization.hadamard import OnlineHadamard
 
@@ -32,6 +33,7 @@ class DuobitLinear(nn.Module):
         activation_bits: int = 16,
         use_hadamard: bool = False,
         n_levels: int = 4,
+        scale_init: str = "var",
     ):
         super().__init__()
         self.in_features = in_features
@@ -41,6 +43,7 @@ class DuobitLinear(nn.Module):
         self.activation_bits = activation_bits
         self.use_hadamard = use_hadamard
         self.n_levels = n_levels
+        self.scale_init = scale_init
 
         if in_features % group_size != 0:
             raise ValueError(
@@ -59,6 +62,11 @@ class DuobitLinear(nn.Module):
         self.register_buffer(
             "scales", torch.ones((out_features, n_groups_per_row, 1), dtype=torch.float32)
         )
+        # Init scale, kept so a trained scale can be floored relative to it: a
+        # group whose scale collapses to zero can never recover.
+        self.register_buffer(
+            "scales_init", torch.ones((out_features, n_groups_per_row, 1), dtype=torch.float32)
+        )
 
         if bias:
             self.bias = nn.Parameter(torch.zeros(out_features))
@@ -75,11 +83,13 @@ class DuobitLinear(nn.Module):
         scales = compute_group_scales(init_w, group_size=self.group_size)
         codes = self.codebook.quantize(init_w, scales)
         rho_val = self.rho if isinstance(self.rho, nn.Parameter) else None
-        mse_scales = compute_mse_group_scales(
-            init_w, codes, self.codebook, group_size=self.group_size, rho=rho_val
-        )
+        fit = compute_var_group_scales if self.scale_init == "var" \
+            else compute_mse_group_scales
+        fitted = fit(init_w, codes, self.codebook, group_size=self.group_size,
+                     rho=rho_val)
         self.codes.copy_(codes)
-        self.scales.copy_(mse_scales)
+        self.scales.copy_(fitted)
+        self.scales_init.copy_(fitted)
 
     def get_dequantized_weight(self) -> torch.Tensor:
         rho_val = self.rho if isinstance(self.rho, nn.Parameter) else None

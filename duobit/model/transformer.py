@@ -32,6 +32,7 @@ def _linear_factory(config: DuobitConfig, use_duobit: Union[bool, str], use_hada
             use_hadamard=had,
             activation_bits=config.activation_bits,
             n_levels=config.resolved_n_levels(),
+            scale_init=config.scale_init,
         )
     return lambda in_f, out_f: nn.Linear(in_f, out_f, bias=False)
 

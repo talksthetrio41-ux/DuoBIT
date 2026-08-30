@@ -89,6 +89,7 @@ def linear_training_bytes(
     block_size: int,
     out_features: int,
     in_features: int,
+    learn_scales: bool = False,
 ) -> Dict[str, int]:
     """Persistent training bytes for one discrete linear map."""
     codes = packed_code_bytes(n_weights, n_levels)
@@ -99,13 +100,19 @@ def linear_training_bytes(
         second_moment = 4 * (out_features + in_features)
     else:
         second_moment = blockwise_nbytes(n_weights, moment_bits, block_size)
-    total = codes + scales + residual + first_moment + second_moment
+    # Training the scales costs, per group: two FP32 Adam moments plus the FP32
+    # init-scale reference that floors them. 3*32/G bits per weight, 0.75 at
+    # G=128. All three are optimizer state and are dropped at inference.
+    scale_moments = 12 * (n_weights // group_size) if learn_scales else 0
+    total = (codes + scales + residual + first_moment + second_moment
+             + scale_moments)
     return {
         "codes": codes,
         "scales": scales,
         "residual": residual,
         "first_moment": first_moment,
         "second_moment": second_moment,
+        "scale_moments": scale_moments,
         "total": total,
     }
 
@@ -135,12 +142,14 @@ def training_memory_report(
     moment_bits = 8
     factored = True
     block_size = 128
+    learn_scales = False
     if optimizer is not None and getattr(optimizer, "param_groups", None):
         g = optimizer.param_groups[0]
         qpefa_bits = int(g.get("qpefa_bits", qpefa_bits))
         moment_bits = int(g.get("moment_bits", moment_bits))
         factored = bool(g.get("factored_second_moment", factored))
         block_size = int(g.get("block_size", block_size))
+        learn_scales = bool(g.get("learn_scales", False))
 
     linear_train = 0
     linear_fp32_adam = 0
@@ -160,6 +169,7 @@ def training_memory_report(
                 block_size=block_size,
                 out_features=module.out_features,
                 in_features=module.in_features,
+                learn_scales=learn_scales,
             )
             linear_train += br["total"]
             linear_fp32_adam += fp32_adam_training_bytes(n)

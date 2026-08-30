@@ -53,6 +53,12 @@ class Trainer:
                 moment_bits=config.moment_bits,
                 factored_second_moment=config.factored_second_moment,
                 block_size=config.block_size,
+                learn_scales=config.learn_scales,
+                scale_lr=config.scale_lr,
+                scale_lr_absolute=config.scale_lr_absolute,
+                scale_min_frac=config.scale_min_frac,
+                scale_relative_lr=config.scale_relative_lr,
+                duobit_weight_decay=config.duobit_weight_decay,
             )
         else:
             self.optimizer = optimizer

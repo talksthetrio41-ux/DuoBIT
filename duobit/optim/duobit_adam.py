@@ -6,7 +6,11 @@ from torch.optim import Optimizer
 
 from duobit.layers.duobit_linear import DuobitLinear
 from duobit.quantization.blockwise import dequantize_blockwise, quantize_blockwise
-from duobit.quantization.codebook import compute_group_scales, compute_mse_group_scales
+from duobit.quantization.codebook import (
+    compute_group_scales,
+    compute_mse_group_scales,
+    compute_scale_grad,
+)
 from duobit.quantization.qpefa import dequantize_residual, quantize_residual
 from duobit.quantization.stochastic import (
     balanced_stochastic_round,
@@ -30,6 +34,14 @@ class DuobitAdam(Optimizer):
 
     Inference checkpoints store only (codes, scales). The residual and the
     Adam moments are discarded.
+
+    The per-group scales are trained from their exact analytic gradient
+    ``dL/ds_g = sum_{i in g} g_i C[z_i]``. They are part of the persistent 2-bit
+    representation, not master weights: they are kept at inference and already
+    counted at 32/G bits per weight. Training them adds only their own two Adam
+    moments (2 * 32 / G bits per weight, 0.5 at G=128), and it is what gives the
+    method a continuous degree of freedom -- without it the scales are frozen at
+    initialization for the whole run.
     """
 
     def __init__(
@@ -56,6 +68,12 @@ class DuobitAdam(Optimizer):
         moment_bits: int = 8,
         factored_second_moment: bool = True,
         block_size: int = 128,
+        learn_scales: bool = True,
+        scale_lr: float = 1e-3,
+        scale_lr_absolute: bool = False,
+        scale_min_frac: float = 0.05,
+        scale_relative_lr: bool = True,
+        duobit_weight_decay: float = 0.0,
     ):
         self.duobit_lr = duobit_lr if duobit_lr is not None else lr
         defaults = dict(
@@ -81,6 +99,12 @@ class DuobitAdam(Optimizer):
             moment_bits=moment_bits,
             factored_second_moment=factored_second_moment,
             block_size=block_size,
+            learn_scales=learn_scales,
+            scale_lr=scale_lr,
+            scale_lr_absolute=scale_lr_absolute,
+            scale_min_frac=scale_min_frac,
+            scale_relative_lr=scale_relative_lr,
+            duobit_weight_decay=duobit_weight_decay,
         )
 
         params = [p for p in model.parameters() if p.requires_grad]
@@ -258,6 +282,29 @@ class DuobitAdam(Optimizer):
             err, layer.scales, bits, pefa_clip, stochastic=stochastic
         )
 
+    def _step_group_scales(self, layer, state, grad, step_t, beta1, beta2, eps,
+                           scale_lr, scale_lr_abs, scale_min_frac):
+        """Adam on the per-group scales from the exact analytic gradient."""
+        rho_val = layer.rho if isinstance(layer.rho, torch.nn.Parameter) else None
+        gs = compute_scale_grad(
+            grad, layer.codes, layer.codebook, group_size=layer.group_size,
+            rho=rho_val,
+        )
+        if "scale_m" not in state:
+            state["scale_m"] = torch.zeros_like(layer.scales)
+            state["scale_v"] = torch.zeros_like(layer.scales)
+        state["scale_m"].mul_(beta1).add_(gs, alpha=1.0 - beta1)
+        state["scale_v"].mul_(beta2).addcmul_(gs, gs, value=1.0 - beta2)
+        m_hat = state["scale_m"] / (1.0 - beta1 ** step_t)
+        v_hat = state["scale_v"] / (1.0 - beta2 ** step_t)
+        direction = m_hat / (v_hat.sqrt() + eps)
+        if scale_lr_abs:
+            layer.scales.add_(direction, alpha=-scale_lr)
+        else:
+            layer.scales.addcmul_(layer.scales, direction, value=-scale_lr)
+        floor = layer.scales_init * scale_min_frac
+        torch.maximum(layer.scales, floor, out=layer.scales)
+
     def _step_duobit_layers(self):
         changed = 0
         total = 0
@@ -291,11 +338,24 @@ class DuobitAdam(Optimizer):
             factored = bool(group_defaults.get("factored_second_moment", True))
             block_size = int(group_defaults.get("block_size", 128))
 
+            learn_scales = bool(group_defaults.get("learn_scales", False))
+            scale_lr = float(group_defaults.get("scale_lr", 1e-3))
+            scale_lr_abs = bool(group_defaults.get("scale_lr_absolute", False))
+            scale_min_frac = float(group_defaults.get("scale_min_frac", 0.05))
+            scale_rel_lr = bool(group_defaults.get("scale_relative_lr", False))
+            duobit_wd = float(group_defaults.get("duobit_weight_decay", 0.0))
+
             if "step" not in state:
                 state["step"] = 0
 
             state["step"] += 1
             step_t = state["step"]
+
+            if learn_scales:
+                self._step_group_scales(
+                    layer, state, grad, step_t, beta1, beta2, eps,
+                    scale_lr, scale_lr_abs, scale_min_frac,
+                )
 
             w_curr = layer.get_dequantized_weight()
             prev_codes = layer.codes.clone()
@@ -327,10 +387,24 @@ class DuobitAdam(Optimizer):
             else:
                 step_direction = m_hat / (torch.sqrt(v_hat) + eps)
 
-            if wd != 0:
-                step_direction = step_direction + wd * w_curr
+            # Decoupled weight decay is meaningless for codes whose magnitude
+            # is carried by s_g: it only biases transitions toward the inner
+            # levels. It defaults to 0 for the discrete path.
+            if duobit_wd != 0:
+                step_direction = step_direction + duobit_wd * w_curr
 
-            w_cand = w_curr - d_lr * step_direction
+            if scale_rel_lr:
+                # Measure the step in units of the group scale, so one learning
+                # rate is commensurate with the codebook gap in every layer even
+                # as the scales themselves train.
+                out_f, in_f = w_curr.shape
+                n_groups = layer.scales.shape[1]
+                gsz = in_f // n_groups
+                lr_eff = (d_lr * layer.scales).expand(out_f, n_groups, gsz).reshape(
+                    out_f, in_f)
+                w_cand = w_curr - lr_eff * step_direction
+            else:
+                w_cand = w_curr - d_lr * step_direction
             rho_val = layer.rho if isinstance(layer.rho, torch.nn.Parameter) else None
 
             if use_pefa:

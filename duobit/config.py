@@ -33,7 +33,11 @@ class DuobitConfig:
     # Error feedback
     enable_error_compensation: bool = False
     use_pefa: bool = True
-    pefa_clip: float = 4.0
+    # The reachable post-quantization residual is 0.5 * gap = 0.333 * s_g, so a
+    # clip of 4.0 spent most of the integer residual grid on values the
+    # accumulator never reaches. 1.0 keeps the headroom and quadruples the
+    # effective resolution at the same bit width.
+    pefa_clip: float = 1.0
     qpefa_bits: int = 8
     qpefa_stochastic: bool = True
     trust_threshold: float = 4.0
@@ -45,15 +49,30 @@ class DuobitConfig:
     factored_second_moment: bool = True
     block_size: int = 128
 
+    # Trained group scales. The scale is part of the persistent 2-bit
+    # representation (kept at inference, already charged at 32/G bits per
+    # weight), so training it does not reintroduce master weights; it adds
+    # 2 * 32 / G bits per weight of optimizer state.
+    learn_scales: bool = True
+    scale_lr: float = 1e-3
+    scale_lr_absolute: bool = False
+    scale_min_frac: float = 0.05
+    scale_relative_lr: bool = True
+    duobit_weight_decay: float = 0.0
+    scale_init: str = "var"  # "var" preserves the group std, "mse" is the v1 fit
+
     # Transition dynamics
     transition_temperature: float = 0.8
     min_transitions_per_group: int = 0
     use_raw_momentum: bool = False
 
-    # Hadamard & scale EMA
+    # Hadamard & legacy scale EMA. Recomputing the MSE scale from the already
+    # dequantized weight is an algebraic fixed point (s* = sum(s c)c / sum(c^2)
+    # = s), so the EMA never moved the scales; it is disabled by default and
+    # kept only to reproduce v1.
     use_hadamard: bool = False
-    scale_update_freq: int = 50
-    scale_ema_alpha: float = 0.01
+    scale_update_freq: int = 0
+    scale_ema_alpha: float = 0.0
 
     # Architecture
     use_swiglu: bool = True

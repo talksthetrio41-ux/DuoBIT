@@ -3,6 +3,8 @@ from duobit.quantization.codebook import (
     SymmetricCodebook,
     compute_group_scales,
     compute_mse_group_scales,
+    compute_scale_grad,
+    compute_var_group_scales,
 )
 from duobit.quantization.qpefa import dequantize_residual, quantize_residual
 from duobit.quantization.stochastic import (
@@ -15,6 +17,8 @@ __all__ = [
     "SymmetricCodebook",
     "compute_group_scales",
     "compute_mse_group_scales",
+    "compute_var_group_scales",
+    "compute_scale_grad",
     "compute_transition_probs",
     "balanced_stochastic_round",
     "quantize_with_residual",

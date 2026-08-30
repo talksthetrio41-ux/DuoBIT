@@ -142,6 +142,67 @@ def compute_mse_group_scales(
     return torch.clamp(num / den, min=1e-5)
 
 
+def compute_var_group_scales(
+    w: torch.Tensor,
+    codes: torch.Tensor,
+    codebook: SymmetricCodebook,
+    group_size: int = 128,
+    rho: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Variance-preserving group scale.
+
+    The MSE-optimal scale minimises ``||w - s C[z]||``, which on a random
+    initialisation systematically shrinks the weight: ``std(s* C[z])`` is
+    0.956 * ``std(w)`` at every fan-in for kaiming_uniform. Composed over the
+    2L linear maps of an L-layer decoder that compounds (0.49x the activation
+    scale at L=8), weakening every residual branch against its skip path and
+    shrinking the logits before the first step. This variant rescales each
+    group so it reproduces the intended standard deviation instead, which is
+    what matters for a random draw.
+    """
+    s = compute_mse_group_scales(w, codes, codebook, group_size=group_size, rho=rho)
+    levels_t = codebook.get_levels_tensor(w.device, dtype=w.dtype, rho=rho)
+    c_val = levels_t[codes.long().clamp(0, levels_t.numel() - 1)]
+    if w.dim() == 2:
+        out_f, in_f = w.shape
+        n_groups = in_f // group_size
+        w_g = w.view(out_f, n_groups, group_size)
+        c_g = c_val.view(out_f, n_groups, group_size)
+        std_w = w_g.std(dim=-1, keepdim=True)
+        std_q = (c_g * s).std(dim=-1, keepdim=True)
+    else:
+        w_g = w.reshape(-1, group_size)
+        c_g = c_val.reshape(-1, group_size)
+        std_w = w_g.std(dim=-1, keepdim=True)
+        std_q = (c_g * s).std(dim=-1, keepdim=True)
+    ratio = torch.clamp(std_w / torch.clamp(std_q, min=1e-12), 0.5, 2.0)
+    return torch.clamp(s * ratio, min=1e-5)
+
+
+def compute_scale_grad(
+    grad: torch.Tensor,
+    codes: torch.Tensor,
+    codebook: SymmetricCodebook,
+    group_size: int = 128,
+    rho: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Exact gradient of the loss with respect to each group scale.
+
+    With ``w_i = s_g C[z_i]`` and the codes held fixed,
+    ``dL/ds_g = sum_{i in g} g_i C[z_i]``. This is what makes the group scale
+    trainable without any master-weight tensor: the scale is already part of
+    the persistent representation, so training it costs only its own two Adam
+    moments (2 * 32 / G bits per weight).
+    """
+    levels_t = codebook.get_levels_tensor(grad.device, dtype=grad.dtype, rho=rho)
+    c_val = levels_t[codes.long().clamp(0, levels_t.numel() - 1)]
+    out_f, in_f = grad.shape
+    n_groups = in_f // group_size
+    g_g = grad.view(out_f, n_groups, group_size)
+    c_g = c_val.view(out_f, n_groups, group_size)
+    return (g_g * c_g).sum(dim=-1, keepdim=True)
+
+
 def bits_per_weight(n_levels: int, group_size: int, scale_bits: int = 32) -> float:
     """Inference bits/weight including per-group scale overhead."""
     code_bits = math.log2(n_levels)
