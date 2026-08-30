@@ -1896,20 +1896,36 @@ def reduce_mean_scalar(t: torch.Tensor, world: int) -> float:
 
 
 def codes_sync_check(model: nn.Module, world: int) -> bool:
-    """Verify DuoBIT codes are bitwise identical across ranks."""
+    """Verify the persistent DuoBIT state is identical on every rank.
+
+    Codes and scales are buffers, and DDP runs with broadcast_buffers=False, so
+    nothing keeps them in step except determinism: identical all-reduced
+    gradients, identical arithmetic, and stochastic rounding drawn from a hash
+    of (element index, step seed) rather than a per-rank RNG. This checks the
+    whole of both tensors -- position-weighted so a permutation cannot cancel --
+    rather than a subsample, since the trained scales are now persistent state
+    too.
+    """
     if world <= 1 or not dist.is_initialized():
         return True
-    s = 0
     dev = torch.device("cpu")
+    acc_c = 0
+    acc_s = torch.zeros((), dtype=torch.float64)
     for m in model.modules():
         if isinstance(m, DuobitLinear):
             dev = m.codes.device
-            s += int(m.codes.flatten()[::9973].to(torch.int64).sum().item())
-    tmin = torch.tensor([s], dtype=torch.int64, device=dev)
-    tmax = torch.tensor([s], dtype=torch.int64, device=dev)
+            n = m.codes.numel()
+            w = torch.arange(1, n + 1, device=dev, dtype=torch.int64)
+            acc_c += int((m.codes.flatten().to(torch.int64) * w).sum().item())
+            acc_s = acc_s + m.scales.double().flatten().mul(
+                torch.arange(1, m.scales.numel() + 1, device=dev,
+                             dtype=torch.float64)).sum().cpu()
+    probe = torch.tensor([float(acc_c % (1 << 40)), float(acc_s)],
+                         dtype=torch.float64, device=dev)
+    tmin, tmax = probe.clone(), probe.clone()
     dist.all_reduce(tmin, op=dist.ReduceOp.MIN)
     dist.all_reduce(tmax, op=dist.ReduceOp.MAX)
-    return bool(int(tmin.item()) == int(tmax.item()) == s)
+    return bool(torch.equal(tmin, tmax) and torch.equal(tmin, probe))
 
 
 def find_free_port() -> int:
