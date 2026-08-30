@@ -56,6 +56,24 @@ def main() -> int:
               + (" ".join(f"{j}={v}" for j, v in knobs.items())
                  if s.get("mode") == "duobit" else ""))
 
+    # The best run at the sweep's horizon is not automatically the best at the
+    # final horizon: too high a rate wins early and plateaus, too low loses
+    # early and catches up. Print the whole curve so the trajectory is visible.
+    curves = {}
+    for k in order:
+        f = Path(a.src) / f"val_curve_{k}.json"
+        if f.exists():
+            curves[k] = json.loads(f.read_text())
+    if curves:
+        steps = sorted({c["step"] for v in curves.values() for c in v})
+        print(f"\nvalidation curve\n{'run':<14}"
+              + "".join(f"{'@'+str(st):>10}" for st in steps))
+        print("-" * (14 + 10 * len(steps)))
+        for k in order:
+            row = {c["step"]: c["val_loss"] for c in curves.get(k, [])}
+            print(f"{k:<14}" + "".join(
+                f"{row[st]:>10.4f}" if st in row else f"{'-':>10}" for st in steps))
+
     duobit = [k for k in order if runs[k].get("mode") == "duobit"]
     if not duobit:
         print("\nno duobit runs in this sweep")
