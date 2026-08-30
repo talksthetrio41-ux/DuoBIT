@@ -47,8 +47,8 @@ def build_dir(name: str, argv: list, work: Path) -> Path:
         'if __name__ == "__main__":\n    main()',
         f"KAGGLE_ARGV = {argv_lit}\n\n"
         'if __name__ == "__main__":\n'
-        "    if len(sys.argv) == 1:\n"
-        "        sys.argv += KAGGLE_ARGV\n"
+        "    # prepended, so the same file can be dry-run locally with overrides\n"
+        "    sys.argv = [sys.argv[0]] + KAGGLE_ARGV + sys.argv[1:]\n"
         "    main()")
     (d / f"{name}.py").write_text(code)
     (d / "kernel-metadata.json").write_text(json.dumps({

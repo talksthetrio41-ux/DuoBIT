@@ -83,9 +83,45 @@ $$
 s_g^\star = \frac{\sum_{i\in g} w_i\, c_i}{\sum_{i\in g} c_i^2 + \varepsilon}, \qquad c_i = C[z_i].
 $$
 
-We use $s_g^\star$ at initialization. During training, scales move by a slow EMA every $F$ steps, $s \leftarrow (1-\alpha)s + \alpha s^\star(\hat W)$ with $\alpha=0.01$, always from the current dequantized weights.
-
 On a Gaussian $64\times 256$ matrix, MSE scales cut reconstruction error by 32–45% for 2-bit and by 88–93% for binary relative to max-abs.
+
+**The EMA scale update is a fixed point (corrected).** Earlier versions of this
+work used $s_g^\star$ at initialization and then moved the scales by a slow EMA
+every $F$ steps, $s \leftarrow (1-\alpha)s + \alpha s^\star(\hat W)$, always
+recomputed from the current *dequantized* weights. That update cannot move
+anything. Substituting $\hat w_i = s_g c_i$ into the least-squares fit gives
+
+$$
+s^\star(\hat W)_g
+= \frac{\sum_i (s_g c_i) c_i}{\sum_i c_i^2 + \varepsilon}
+= s_g \cdot \frac{\sum_i c_i^2}{\sum_i c_i^2 + \varepsilon}
+\;\approx\; s_g ,
+$$
+
+so the EMA target *is* the current scale and the recursion is stationary. In a
+3000-step FineWeb-EDU run the measured mean scale moved by $2\times10^{-7}$
+relative between step 1 and step 3000. The consequence is severe: the group
+scale is the method's only continuous degree of freedom, and it was frozen at
+its initialization for the entire run. Section 3.9 replaces the EMA with the
+exact scale gradient.
+
+**Variance-preserving initialization.** The MSE fit is also the wrong objective
+at initialization. It minimises $\lVert w - s\,C[z] \rVert$ for the particular
+random draw, and in doing so it systematically shrinks the weight: measured on
+`kaiming_uniform`, $\operatorname{std}(s^\star C[z]) = 0.956\,
+\operatorname{std}(w)$ at every fan-in. Composed over the $2L$ linear maps of an
+$L$-layer decoder that compounds to $0.956^{2L}$ — $0.49\times$ the activation
+scale at $L=8$, $0.24\times$ at $L=16$ — which weakens every residual branch
+against its skip path and shrinks the logits before a single step is taken. For
+a random init what matters is the forward variance, not the particular draw, so
+we rescale each group to reproduce its intended standard deviation:
+
+$$
+s_g^{\mathrm{var}} = s_g^\star \cdot
+\operatorname{clip}\!\left(
+\frac{\operatorname{std}_{i \in g}(w_i)}{\operatorname{std}_{i \in g}(s_g^\star c_i)},
+\; 0.5,\; 2 \right).
+$$
 
 ### 3.3 Ephemeral Adam step
 
@@ -106,6 +142,14 @@ The classical fix is error feedback (Seide et al., 2014; Karimireddy et al., 201
 ### 3.5 QPEFA
 
 The residual is bounded. After nearest-neighbour quantization it lives inside a Voronoi cell, and we clip it to $\pm \lambda s_g$ to allow a few multi-level jumps without letting an outlier dominate. A bounded tensor with a known per-group scale is a good candidate for integer quantization.
+
+The clip $\lambda$ sets the resolution, and the earlier default wasted most of
+it. One integer step of the residual is $\lambda s_g / q_{\max}$, i.e. a
+fraction $\lambda / (q_{\max}(1-\rho))$ of a codebook gap. At $\lambda = 4$ and
+$b = 8$ that is 4.7% of a gap; at $\lambda = 1$ it is 1.2%. Since the whole
+purpose of the accumulator is to hold updates *smaller* than a gap until they
+sum to one, resolution is the quantity that matters, and $\lambda$ should be
+just large enough to hold the accumulated step. We use $\lambda = 1$.
 
 Let $q_{\max} = 2^{b-1}-1$. Store a signed integer $q$ of $b$ bits (default $b=8$, ablation $b=4$) and reconstruct
 
@@ -156,7 +200,59 @@ Embeddings and RMSNorm stay on ordinary FP32 Adam. They are a small fraction of 
 
 Optional W2A8: per-token absmax quantization of activations to INT8 with STE. Optional online Walsh–Hadamard rotation of incoming features. The decoder is otherwise standard: RMSNorm, RoPE, causal attention, SwiGLU.
 
-### 3.8 Memory accounting
+### 3.8 Trainable group scales
+
+The codes carry the *shape* of a group and the scale carries its *magnitude*.
+Once the EMA is recognised as a fixed point (Section 3.2), the magnitude has no
+learning signal at all, and a 2-bit code with a frozen scale cannot represent a
+weight whose magnitude needs to change. The fix does not require a master
+weight, because the scale is already part of the persistent representation: it
+is stored, kept at inference, and already charged at $32/G$ bits per weight.
+
+Holding the codes fixed, $w_i = s_g C[z_i]$ is linear in $s_g$, so the gradient
+is exact and costs one reduction over each group:
+
+$$
+\frac{\partial \mathcal{L}}{\partial s_g}
+= \sum_{i \in g} \frac{\partial \mathcal{L}}{\partial w_i} \, C[z_i].
+$$
+
+We take an ordinary Adam step on $s$ with its own rate, in relative form so a
+group's magnitude moves by a bounded fraction per step regardless of fan-in,
+and floor it against its initialization so a group cannot collapse to zero and
+become unrecoverable:
+
+$$
+s_g \leftarrow \max\!\left(
+s_g\left(1 - \eta_s \frac{\hat m^{(s)}_g}{\sqrt{\hat v^{(s)}_g}+\varepsilon}\right),
+\; \kappa\, s_g^{(0)} \right), \qquad \kappa = 0.05 .
+$$
+
+The cost is three FP32 values per group — two Adam moments and the
+initialization reference — i.e. $3 \cdot 32/G$ bits per weight, or 0.75 at
+$G=128$, against the $\approx 19$ bits per weight the discrete path already
+uses. All three are optimizer state and are discarded at inference; the
+inference footprint is unchanged.
+
+**Scale-relative discrete rate.** With the scales now moving, a single absolute
+$\eta_{\mathrm{duobit}}$ is no longer commensurate with the codebook gap across
+layers, since the gap is $s_g(1-\rho)$ and $s_g$ varies with fan-in and with
+training. We therefore measure the discrete step in units of the group scale,
+
+$$
+\tilde W_{t+1} = \hat W_t - \eta_{\mathrm{duobit}}\, s_g\,
+\frac{\hat m_t}{\sqrt{\hat v_t}+\varepsilon},
+$$
+
+so $\eta_{\mathrm{duobit}}$ has a single meaning everywhere: the fraction of a
+group scale traversed by a unit Adam step.
+
+**Weight decay.** Decoupled weight decay on the discrete path is meaningless:
+the magnitude of $w_i$ lives in $s_g$, not in $z_i$, so decaying $\hat W$ only
+biases transitions toward the inner levels. It is set to zero; embeddings and
+norm gains keep ordinary AdamW decay.
+
+### 3.9 Memory accounting
 
 Packed inference bytes for a DuobitLinear of $N$ weights, $L$ levels, group size $G$:
 
@@ -169,8 +265,11 @@ Linear bits/weight at inference are $\log_2 L + 32/G$. For $L=4, G=32$ that is 3
 Persistent training bytes for the same layer, with QPEFA bit-width $b_e$, moment bit-width $b_m$, block size $B$:
 
 $$
-B_{\mathrm{train}} = B_{\mathrm{inf}} + \Big\lceil N b_e / 8\Big\rceil + \Big\lceil N b_m / 8\Big\rceil + 4\lceil N/B\rceil + 4(m+n).
+B_{\mathrm{train}} = B_{\mathrm{inf}} + \Big\lceil N b_e / 8\Big\rceil + \Big\lceil N b_m / 8\Big\rceil + 4\lceil N/B\rceil + 4(m+n) + 12\,(N/G),
 $$
+
+where the last term is the trained-scale state of Section 3.8 (two Adam moments
+and the initialization reference, $3\cdot32/G$ bits per weight).
 
 For $b_e=b_m=8$, $G=32$, $B=64$ this is 20.3 bits per linear weight in the tiny run, versus 96 for FP32 Adam ($W+m+v$) and versus 96 for latent-weight STE (master $W$ in FP32 plus $m,v$). The 4-bit residual variant is 16.3 bits/weight.
 
