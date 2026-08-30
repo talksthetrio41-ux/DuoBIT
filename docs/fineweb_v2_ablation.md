@@ -79,8 +79,8 @@ baseline narrows from +0.587 to +0.178 nats — 70% of it closed.
 |---|---|---|
 | linear train bits/weight | 19.35 | 96.00 |
 | linear inference bits/weight | 2.25 | 32.00 |
-| persistent train state | 289.9 MB | 905.6 MB |
-| inference footprint | 81.7 MB | 301.9 MB |
+| persistent train state | 289.9 MiB | 563.3 MiB |
+| inference footprint | 81.7 MiB | 187.8 MiB |
 | throughput | 23,671 tok/s | 24,549 tok/s |
 
 DuoBIT now runs at **0.964x** the FP32 throughput, against 0.915x for v1 at a
@@ -93,3 +93,8 @@ Every DuoBIT run passed the cross-rank consistency check at both checkpoints
 on both GPUs under `broadcast_buffers=False` — determinism alone holds them
 together, via hash-based stochastic rounding keyed on (element index, step).
 No run had a non-finite step.
+
+> The FP32 memory figures were recomputed after fixing a double count in this
+> harness: the dense baselines charged their linear weights once as linear maps
+> and again as parameters. DuoBIT rows were never affected (its codes and scales
+> are buffers, not parameters), nor was any quality or throughput number.

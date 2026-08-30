@@ -1,0 +1,23 @@
+metric,duobit-v2,fp32,fp16
+params,"77,161,984","77,161,984","77,161,984"
+steps,"3,000","3,000","3,000"
+tokens seen,"49,152,000","49,152,000","49,152,000"
+wall time (s),"3,738.1","3,566.4","1,459.8"
+avg tok/s (steps),"13,470","14,083","35,508"
+final train loss,5.0546,4.6124,4.6128
+best val loss,5.0462,4.5968,4.5969
+final val loss,5.0462,4.5968,4.5969
+final val ppl,155.43,99.16,99.17
+peak GPU mem MB,"10,182","10,219","8,579"
+avg GPU mem MB,"2,632","3,066","2,284"
+persistent train MB,413.1,"1,471.5","1,471.5"
+inference MB,112.0,490.5,392.4
+linear train bits/weight,19.33,96.00,96.00
+linear infer bits/weight,2.25,32.00,16.00
+train compression vs FP32,2.14,1.00,1.00
+inference compression vs FP32,2.63,1.00,1.25
+mean grad norm,0.0298,0.4490,0.4498
+mean transition rate,0.01489,n/a,n/a
+mean |QPEFA residual|,0.015518,n/a,n/a
+final scale/init ratio,0.824,n/a,n/a
+skipped steps,0,0,0

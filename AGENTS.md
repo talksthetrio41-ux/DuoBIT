@@ -7,14 +7,22 @@ Native 2-bit / ternary / binary pretraining **without master weights**. Linear m
 
 ## Headline
 
-On a 94,528-parameter decoder (50 steps, CPU):
+FineWeb-EDU, 77.2M parameters, 3000 steps (49.2M tokens), 2x Tesla T4, identical
+data/seed/budget across runs:
 
-- 2-bit QPEFA-8 val 1.23 / PPL 3.41 / 100% grammar / 0.056 MB infer / 0.288 MB train / 20.3 linear train bits/wt
-- FP32 Adam val 2.52 / PPL 12.43 / 70% acc / 0.361 MB infer / 1.082 MB train / 96 bits/wt
-- Latent-weight STE val 2.83 / 40% acc / same memory as FP32
-- QPEFA-4 val 1.25 / 16.3 train bits/wt
+| | DUOBIT v2 | DUOBIT v1 | FP32 AdamW | FP16 AMP |
+|---|---|---|---|---|
+| val loss / PPL | **5.046 / 155.4** | 5.537 / 254.0 | **4.597 / 99.2** | 4.597 / 99.2 |
+| linear train bits/wt | 19.33 | 18.58 | 96.00 | 96.00 |
+| linear infer bits/wt | 2.25 | 2.25 | 32.00 | 16.00 |
+| train state / inference | 413 / 112 MiB | 409 / 112 | 883 / 294 | 883 / 196 |
+| throughput | 13,470 tok/s | 13,184 | 14,083 | 35,508 |
 
-Paper: `paper/duobit_est.md`
+Tuning moved DuoBIT 0.49 nats and closed 52% of the gap to FP32; it is closer,
+not equal. DuoBIT buys memory (4.97x training state, 14.2x inference storage on
+the linear maps), not speed -- FP16 AMP matches FP32 quality at 2.5x the
+throughput. Full results and caveats: `docs/fineweb_v2_results.md`, ablation:
+`docs/fineweb_v2_ablation.md`.
 
 ## What changed in v2 (read this first)
 

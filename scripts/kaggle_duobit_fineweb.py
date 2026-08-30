@@ -1509,6 +1509,7 @@ def persistent_state_report(model: nn.Module, args, mode: str,
     """
     is_duobit = (mode == "duobit")
     learn_scales = bool(int(getattr(args, "learn_scales", 0))) and is_duobit
+    counted: set = set()          # tensors already charged by the module loop
     n_lin = 0
     lin_train = 0          # persistent training state of the linear maps, bytes
     lin_infer = 0          # packed inference footprint of the linear maps, bytes
@@ -1545,8 +1546,15 @@ def persistent_state_report(model: nn.Module, args, mode: str,
             lin_infer += int(n * infer_w_bits / 8.0)
             fp32_lin_train += 12 * n
             fp32_lin_infer += 4 * n
+            counted.add(id(m.weight))
+            if m.bias is not None:
+                counted.add(id(m.bias))
 
-    other_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # Everything the module loop did not already charge. In the dense regimes
+    # the linear weights are ordinary Parameters, so without this exclusion they
+    # would be counted twice -- once as linear maps and once again here.
+    other_params = sum(p.numel() for p in model.parameters()
+                       if p.requires_grad and id(p) not in counted)
     other_train = 12 * other_params   # FP32 W + m + v for embeddings / norms
     other_infer = 4 * other_params
 

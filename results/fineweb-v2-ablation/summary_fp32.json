@@ -34,17 +34,17 @@
   "optimizer": 641.0381693840027
  },
  "persistent": {
-  "n_params_total": 79134720.0,
+  "n_params_total": 49219200.0,
   "n_linear_weights": 29915520.0,
-  "n_fp32_params": 49219200.0,
+  "n_fp32_params": 19303680.0,
   "linear_train_bits_per_weight": 96.0,
   "linear_infer_bits_per_weight": 32.0,
-  "persistent_train_mb": 905.625,
-  "persistent_train_mb_as_stored": 905.625,
-  "persistent_train_mb_fp32_ref": 905.625,
+  "persistent_train_mb": 563.26904296875,
+  "persistent_train_mb_as_stored": 563.26904296875,
+  "persistent_train_mb_fp32_ref": 563.26904296875,
   "persistent_train_compression_vs_fp32": 1.0,
-  "inference_mb": 301.875,
-  "inference_mb_fp32_ref": 301.875,
+  "inference_mb": 187.75634765625,
+  "inference_mb_fp32_ref": 187.75634765625,
   "inference_compression_vs_fp32": 1.0
  },
  "config": {
