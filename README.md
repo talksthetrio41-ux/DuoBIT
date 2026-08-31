@@ -12,7 +12,8 @@ Native 2-bit / ternary / binary pretraining **without a full-precision master-we
   ablation: [`docs/fineweb_v2_ablation.md`](docs/fineweb_v2_ablation.md)
 - Experiments: `scripts/run_experiments.py` (CPU),
   `scripts/kaggle_duobit_fineweb.py` (GPU / DDP)
-- Tests: `python3 -m pytest tests/ -v` (27 passing)
+- Tests: `python3 -m pytest tests/ -v` (30 passing)
+- Config pre-flight: `python3 scripts/validate_configs.py`
 
 ## Install
 
