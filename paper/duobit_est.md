@@ -252,7 +252,42 @@ the magnitude of $w_i$ lives in $s_g$, not in $z_i$, so decaying $\hat W$ only
 biases transitions toward the inner levels. It is set to zero; embeddings and
 norm gains keep ordinary AdamW decay.
 
-### 3.9 Memory accounting
+### 3.9 The embedding table
+
+Sections 3.1-3.8 all act on the linear maps, and on a real decoder that is not
+where the memory is. Measured on the 77.2M-parameter FineWeb-EDU model of
+Section 5, with every linear map at 2-bit codes and compressed optimizer state:
+
+| | training state | share | inference | share |
+|---|---|---|---|---|
+| linear maps (2-bit) | 118.5 MiB | 29% | 13.8 MiB | 12% |
+| embedding table + norms (FP32) | 294.6 MiB | 71% | 98.2 MiB | 88% |
+
+The remaining levers on the linear side are correspondingly small: halving the
+QPEFA and first-moment bit-widths to 4 removes 12% of training state and
+nothing at inference; doubling the group size removes 0.7% of each. Holding the
+embedding table in the same representation removes **57% of training state and
+82% of the inference footprint**.
+
+A lookup table is a matrix, so it needs no new machinery: store $z$ and $s_g$
+per row-group exactly as in Section 3.1, materialise
+$\hat E = \mathrm{dequant}(z, s)$ for the lookup, and let the optimizer of
+Sections 3.5-3.8 act on $\nabla_{\hat E}\mathcal{L}$. The persistent state is
+$\log_2 L + 32/G$ bits per entry, and no FP32 table exists at any point.
+
+The one structural difference is sparsity. Only rows for tokens present in the
+batch receive a gradient -- about 93-95% of rows are zero at typical batch
+sizes -- so most rows see a long run of exactly zero updates punctuated by
+occasional ones. This is the regime QPEFA was built for: the residual holds a
+row's accumulated sub-threshold movement indefinitely and flips its codes only
+when the accumulation crosses a Voronoi boundary, so a rare token's updates are
+neither discarded nor amplified. Note that the factored second moment is a
+weaker fit here than for a dense matrix, since its row statistic decays toward
+zero for tokens that have not appeared recently; the first moment decays faster
+($\beta_1^k$ against $\beta_2^{k/2}$), so stale rows take smaller steps rather
+than exploding ones.
+
+### 3.10 Memory accounting
 
 Packed inference bytes for a DuobitLinear of $N$ weights, $L$ levels, group size $G$:
 
@@ -269,7 +304,9 @@ B_{\mathrm{train}} = B_{\mathrm{inf}} + \Big\lceil N b_e / 8\Big\rceil + \Big\lc
 $$
 
 where the last term is the trained-scale state of Section 3.8 (two Adam moments
-and the initialization reference, $3\cdot32/G$ bits per weight).
+and the initialization reference, $3\cdot32/G$ bits per weight). The same
+formula applies to a quantized embedding table (Section 3.9), with $m$ the
+vocabulary size and $n$ the model dimension.
 
 For $b_e=b_m=8$, $G=32$, $B=64$ this is 20.3 bits per linear weight in the tiny run, versus 96 for FP32 Adam ($W+m+v$) and versus 96 for latent-weight STE (master $W$ in FP32 plus $m,v$). The 4-bit residual variant is 16.3 bits/weight.
 
