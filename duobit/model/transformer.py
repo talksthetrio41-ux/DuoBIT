@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from duobit.config import DuobitConfig
+from duobit.layers.duobit_embedding import DuobitEmbedding
 from duobit.layers.duobit_linear import DuobitLinear
 from duobit.layers.ste_linear import SteQuantLinear
 from duobit.model.utils import RMSNorm, RotaryEmbedding, apply_rotary_pos_emb
@@ -109,7 +110,17 @@ class DuobitTransformer(nn.Module):
             use_duobit = False
         self.use_duobit = use_duobit
         self.gradient_checkpointing = config.gradient_checkpointing
-        self.tok_embeddings = nn.Embedding(config.vocab_size, config.d_model)
+        if config.quant_embeddings and use_duobit and use_duobit != "ste":
+            self.tok_embeddings = DuobitEmbedding(
+                config.vocab_size,
+                config.d_model,
+                group_size=config.group_size,
+                rho=config.rho,
+                n_levels=config.resolved_n_levels(),
+                scale_init=config.scale_init,
+            )
+        else:
+            self.tok_embeddings = nn.Embedding(config.vocab_size, config.d_model)
         self.layers = nn.ModuleList(
             [DuobitTransformerBlock(config, use_duobit=use_duobit) for _ in range(config.n_layers)]
         )
@@ -138,7 +149,7 @@ class DuobitTransformer(nn.Module):
     def count_parameters(self) -> int:
         n = 0
         for m in self.modules():
-            if isinstance(m, DuobitLinear):
+            if isinstance(m, (DuobitLinear, DuobitEmbedding)):
                 n += m.codes.numel()
                 if m.bias is not None:
                     n += m.bias.numel()

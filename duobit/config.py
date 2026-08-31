@@ -60,6 +60,11 @@ class DuobitConfig:
     scale_relative_lr: bool = True
     duobit_weight_decay: float = 0.0
     scale_init: str = "var"  # "var" preserves the group std, "mse" is the v1 fit
+    # Hold the token embedding table as codes + trained scales too. On a real
+    # decoder the FP32 table dominates: at 77M params it is 71% of persistent
+    # training state and 88% of the inference footprint, against 29% and 12%
+    # for every 2-bit linear map combined.
+    quant_embeddings: bool = False
 
     # Transition dynamics
     transition_temperature: float = 0.8

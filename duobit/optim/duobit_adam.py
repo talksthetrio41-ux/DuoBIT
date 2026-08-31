@@ -4,7 +4,7 @@ from typing import List, Optional
 import torch
 from torch.optim import Optimizer
 
-from duobit.layers.duobit_linear import DuobitLinear
+from duobit.layers import DUOBIT_MODULES, DuobitLinear
 from duobit.quantization.blockwise import dequantize_blockwise, quantize_blockwise
 from duobit.quantization.codebook import (
     compute_group_scales,
@@ -114,8 +114,8 @@ class DuobitAdam(Optimizer):
 
         super().__init__(params, defaults)
 
-        self.duobit_layers: List[DuobitLinear] = [
-            m for m in model.modules() if isinstance(m, DuobitLinear)
+        self.duobit_layers: List[torch.nn.Module] = [
+            m for m in model.modules() if isinstance(m, DUOBIT_MODULES)
         ]
         self.step_count = 0
         self.last_transition_frac = 0.0
@@ -253,7 +253,7 @@ class DuobitAdam(Optimizer):
         state["exp_avg_sq_shape"] = shape
         state["exp_avg_sq_pad"] = pad
 
-    def _load_error(self, state, layer: DuobitLinear, bits: int, pefa_clip: float):
+    def _load_error(self, state, layer, bits: int, pefa_clip: float):
         if bits >= 16:
             if "error" not in state:
                 state["error"] = torch.zeros(
@@ -270,7 +270,7 @@ class DuobitAdam(Optimizer):
         self,
         state,
         err: torch.Tensor,
-        layer: DuobitLinear,
+        layer,
         bits: int,
         pefa_clip: float,
         stochastic: bool,

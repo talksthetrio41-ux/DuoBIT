@@ -166,6 +166,12 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--duobit-wd", type=float, default=0.0,
                    help="weight decay applied inside the discrete update "
                         "(v1 used --wd here; 0 is the v2 default)")
+    p.add_argument("--quant-embeddings", type=int, default=0, choices=[0, 1],
+                   help="hold the token embedding table as codes + trained group "
+                        "scales too (duobit mode only). The FP32 table is 71%% of "
+                        "persistent training state and 88%% of the inference "
+                        "footprint at 77M params, so this is the dominant "
+                        "compression lever")
     p.add_argument("--scale-init", default="var", choices=["var", "mse"],
                    help="group-scale fit at init: 'mse' minimises ||w - s C[z]|| "
                         "(v1, shrinks weight std by ~4.4%% per layer); 'var' "
@@ -1095,6 +1101,78 @@ class DuobitLinear(nn.Module):
         return F.linear(x, w, None)
 
 
+class DuobitEmbedding(nn.Module):
+    """Token embedding table stored as discrete codes + trained group scales.
+
+    A lookup table is just another matrix, so this reuses DuobitLinear's exact
+    persistent representation (uint8 codes, FP32 per-group scales, no master
+    weight) and exposes the same attributes, which lets the optimizer, the
+    memory report and the cross-rank check treat both through one path.
+
+    This matters more than any remaining knob on the linear side: in the 77M
+    reference model the FP32 embedding table is 71% of persistent training
+    state and 88% of the inference footprint, against 29% and 12% for all the
+    2-bit linear maps combined.
+    """
+
+    def __init__(self, num_embeddings: int, embedding_dim: int, n_levels: int = 4,
+                 rho: float = 1.0 / 3.0, group_size: int = 128,
+                 init_std: float = 0.0, scale_init: str = "var"):
+        super().__init__()
+        if embedding_dim % group_size != 0:
+            raise ValueError(f"embedding_dim ({embedding_dim}) must be divisible "
+                             f"by group_size ({group_size})")
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.in_features = embedding_dim
+        self.out_features = num_embeddings
+        self.group_size = group_size
+        self.n_levels = n_levels
+        self.rho = float(rho)
+        # nn.Embedding initialises N(0,1); keep that unless --init-std overrides
+        self.init_std = float(init_std) if init_std > 0 else 1.0
+        self.scale_init = str(scale_init)
+        n_groups = embedding_dim // group_size
+        self.register_buffer("codes", torch.zeros((num_embeddings, embedding_dim),
+                                                  dtype=torch.uint8))
+        self.register_buffer("scales", torch.ones((num_embeddings, n_groups),
+                                                  dtype=torch.float32))
+        self.register_buffer("scales_init", torch.ones((num_embeddings, n_groups),
+                                                       dtype=torch.float32))
+        self.ephemeral_w: Optional[torch.Tensor] = None
+        self.reset_parameters()
+
+    @property
+    def levels(self) -> torch.Tensor:
+        return levels_for(self.n_levels, self.rho, self.codes.device)
+
+    def reset_parameters(self):
+        init_w = torch.empty((self.num_embeddings, self.embedding_dim))
+        init_w.normal_(0.0, self.init_std)
+        s = maxabs_group_scales(init_w, self.group_size)
+        codes, _, _ = q_weight(init_w, s, self.levels, self.group_size)
+        fit = var_group_scales if self.scale_init == "var" else mse_group_scales
+        s_fit = fit(init_w, codes, self.levels, self.group_size)
+        self.codes.copy_(codes)
+        self.scales.copy_(s_fit)
+        self.scales_init.copy_(s_fit)
+
+    def dequant(self) -> torch.Tensor:
+        return dq_weight(self.codes, self.scales, self.levels, self.group_size)
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        w = self.dequant()
+        if self.training:
+            w.requires_grad_(True)
+            self.ephemeral_w = w
+        return F.embedding(ids, w)
+
+
+# Every module whose weights persist as codes + scales. The optimizer, the
+# memory accounting and the DDP consistency check dispatch on this tuple.
+DUOBIT_MODULES = (DuobitLinear, DuobitEmbedding)
+
+
 # ----------------------------------------------------------------------------
 # Model (GPT-style decoder: RMSNorm, RoPE, causal SDPA, SwiGLU)
 # ----------------------------------------------------------------------------
@@ -1225,9 +1303,17 @@ class Transformer(nn.Module):
         super().__init__()
         self.args = args
         self.vocab_size = 50257
-        self.tok_embeddings = nn.Embedding(self.vocab_size, args.d_model)
-        if float(getattr(args, "init_std", 0.0) or 0.0) > 0:
-            nn.init.normal_(self.tok_embeddings.weight, mean=0.0, std=args.init_std)
+        quant_emb = use_duobit and bool(int(getattr(args, "quant_embeddings", 0)))
+        if quant_emb:
+            self.tok_embeddings = DuobitEmbedding(
+                self.vocab_size, args.d_model, n_levels=args.n_levels, rho=args.rho,
+                group_size=args.group_size,
+                init_std=float(getattr(args, "init_std", 0.0) or 0.0),
+                scale_init=getattr(args, "scale_init", "var"))
+        else:
+            self.tok_embeddings = nn.Embedding(self.vocab_size, args.d_model)
+            if float(getattr(args, "init_std", 0.0) or 0.0) > 0:
+                nn.init.normal_(self.tok_embeddings.weight, mean=0.0, std=args.init_std)
         self.layers = nn.ModuleList([Block(args, use_duobit) for _ in range(args.n_layers)])
         self.norm = RMSNorm(args.d_model)
         self.lm_head = make_linear(args, use_duobit, args.d_model, self.vocab_size)
@@ -1251,7 +1337,7 @@ class Transformer(nn.Module):
     def count_parameters(self) -> int:
         total = 0
         for m in self.modules():
-            if isinstance(m, DuobitLinear):
+            if isinstance(m, DUOBIT_MODULES):
                 total += m.codes.numel()
             elif isinstance(m, nn.Linear):
                 total += m.weight.numel() + (m.bias.numel() if m.bias is not None else 0)
@@ -1291,7 +1377,8 @@ class DuobitAdam:
         self.args = args
         self.device = device
         self.seed = int(seed)
-        self.duobit_layers = [m for m in model.modules() if isinstance(m, DuobitLinear)]
+        self.duobit_layers = [m for m in model.modules()
+                              if isinstance(m, DUOBIT_MODULES)]
         self.params = [p for p in model.parameters() if p.requires_grad]
         self.lr = args.lr
         self.duobit_lr = args.duobit_lr
@@ -1387,7 +1474,7 @@ class DuobitAdam:
             denom = (st["v"].sqrt() / math.sqrt(bc2)).add_(eps)
             p.data.addcdiv_(st["m"], denom, value=-(lr / bc1))
 
-    def _init_layer_state(self, lyr: DuobitLinear) -> Dict[str, Any]:
+    def _init_layer_state(self, lyr) -> Dict[str, Any]:
         a = self.args
         O, I = lyr.codes.shape
         n = lyr.codes.numel()
@@ -1407,7 +1494,7 @@ class DuobitAdam:
             st["s_v"] = torch.zeros_like(lyr.scales)
         return st
 
-    def _step_scales(self, lyr: DuobitLinear, st: Dict[str, Any],
+    def _step_scales(self, lyr, st: Dict[str, Any],
                      grad: torch.Tensor, t: int) -> None:
         """Adam on the per-group scales from the exact analytic gradient."""
         b1, b2, eps = self.b1, self.b2, self.eps
@@ -1511,6 +1598,7 @@ def persistent_state_report(model: nn.Module, args, mode: str,
     learn_scales = bool(int(getattr(args, "learn_scales", 0))) and is_duobit
     counted: set = set()          # tensors already charged by the module loop
     n_lin = 0
+    n_quant_embed = 0             # embedding weights held as codes + scales
     lin_train = 0          # persistent training state of the linear maps, bytes
     lin_infer = 0          # packed inference footprint of the linear maps, bytes
     as_stored = 0.0        # actual torch storage bytes (unpacked uint8 codes etc.)
@@ -1519,9 +1607,11 @@ def persistent_state_report(model: nn.Module, args, mode: str,
     infer_w_bits = 32.0 if mode == "fp32" else (16.0 if mode == "fp16" else 0.0)
 
     for m in model.modules():
-        if isinstance(m, DuobitLinear):
+        if isinstance(m, DUOBIT_MODULES):
             n = m.codes.numel()
             O, I = m.codes.shape
+            if isinstance(m, DuobitEmbedding):
+                n_quant_embed += n
             n_groups = I // m.group_size
             n_lin += n
             code_bytes = int(math.ceil(math.log2(m.n_levels) * n / 8.0))
@@ -1558,6 +1648,9 @@ def persistent_state_report(model: nn.Module, args, mode: str,
     other_train = 12 * other_params   # FP32 W + m + v for embeddings / norms
     other_infer = 4 * other_params
 
+    # An nn.Embedding that was replaced by a DuobitEmbedding is no longer an
+    # FP32 parameter, so it drops out of `other_params` on its own; it is
+    # charged above at the same bits/weight as the linear maps.
     if is_duobit and optimizer is not None and getattr(optimizer, "dstate", None):
         for st in optimizer.dstate.values():
             as_stored += st["e_q"].numel()
@@ -1574,6 +1667,7 @@ def persistent_state_report(model: nn.Module, args, mode: str,
     return {
         "n_params_total": float(n_lin + other_params),
         "n_linear_weights": float(n_lin),
+        "n_quantized_embedding_weights": float(n_quant_embed),
         "n_fp32_params": float(other_params),
         "linear_train_bits_per_weight": (8.0 * lin_train / n_lin) if n_lin else 0.0,
         "linear_infer_bits_per_weight": (8.0 * lin_infer / n_lin) if n_lin else 0.0,
@@ -1920,7 +2014,7 @@ def codes_sync_check(model: nn.Module, world: int) -> bool:
     acc_c = 0
     acc_s = torch.zeros((), dtype=torch.float64)
     for m in model.modules():
-        if isinstance(m, DuobitLinear):
+        if isinstance(m, DUOBIT_MODULES):
             dev = m.codes.device
             n = m.codes.numel()
             w = torch.arange(1, n + 1, device=dev, dtype=torch.int64)
@@ -2090,7 +2184,11 @@ def run_experiment(name: str, mode: str, rank: int, world: int, args,
               f"(FP32 Adam = 96.0) | train state = "
               f"{persist['persistent_train_mb']:.1f} MB vs "
               f"{persist['persistent_train_mb_fp32_ref']:.1f} MB FP32", flush=True)
-        print(f"[{tag}] inference = {persist['inference_mb']:.1f} MB vs "
+        n_qe = int(persist.get("n_quantized_embedding_weights", 0))
+        if n_qe:
+            print(f"[{tag}] embedding table is quantized too: {n_qe:,} weights as "
+                  f"codes + trained scales (no FP32 table)", flush=True)
+        print(f"[{tag}] inference = {persist['inference_mb']:.1f} MiB vs "
               f"{persist['inference_mb_fp32_ref']:.1f} MB FP32 "
               f"({persist['linear_infer_bits_per_weight']:.2f} bits/linear wt)",
               flush=True)
@@ -2433,7 +2531,8 @@ def run_label(name: str, summary: Dict[str, Any], args) -> str:
     return base if name == mode else f"{name}: {base}"
 
 
-def make_report(results: Dict[str, Any], args, out_dir: Path, hw_info: Dict[str, Any]):
+def make_report(results: Dict[str, Any], args, out_dir: Path,
+                hw_info: Dict[str, Any], figures: bool = True):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -2450,6 +2549,9 @@ def make_report(results: Dict[str, Any], args, out_dir: Path, hw_info: Dict[str,
     duobit_runs = [k for k in order if runs[k]["summary"].get("mode") == "duobit"]
 
     def save(fig, name):
+        if not figures:
+            plt.close(fig)
+            return
         fig.savefig(fig_dir / name, dpi=150)
         plt.close(fig)
         print(f"[report] figures/{name}", flush=True)
@@ -2959,8 +3061,11 @@ def worker(rank: int, world: int, args):
             # write the report after every run so a run that is cut short by the
             # session time limit still leaves a complete report for what finished
             try:
+                # figures only once the last run is in: they are the expensive
+                # part of the report and every earlier pass would be discarded
                 make_report(results, args, Path(args.out_dir),
-                            hw or collect_hw_info())
+                            hw or collect_hw_info(),
+                            figures=(spec is specs[-1]))
             except Exception as e:
                 traceback.print_exc()
                 print(f"[report] generation failed: {e}", flush=True)

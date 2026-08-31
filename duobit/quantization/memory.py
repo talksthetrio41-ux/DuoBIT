@@ -4,7 +4,7 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 
-from duobit.layers.duobit_linear import DuobitLinear
+from duobit.layers import DUOBIT_MODULES, DuobitLinear
 from duobit.layers.ste_linear import SteQuantLinear
 from duobit.quantization.blockwise import blockwise_nbytes
 from duobit.quantization.qpefa import residual_nbytes
@@ -29,7 +29,7 @@ def inference_memory_report(model: nn.Module) -> Dict[str, float]:
 
     counted = set()
     for module in model.modules():
-        if isinstance(module, DuobitLinear):
+        if isinstance(module, DUOBIT_MODULES):
             n = module.codes.numel()
             n_linear_w += n
             code_bits += math.log2(module.n_levels) * n
@@ -156,7 +156,7 @@ def training_memory_report(
     linear_bitnet = 0
     n_linear = 0
     for module in model.modules():
-        if isinstance(module, DuobitLinear):
+        if isinstance(module, DUOBIT_MODULES):
             n = module.codes.numel()
             n_linear += n
             br = linear_training_bytes(
@@ -180,7 +180,7 @@ def training_memory_report(
             linear_train += bitnet_training_bytes(n, weight_bytes=4)
             linear_fp32_adam += fp32_adam_training_bytes(n)
             linear_bitnet += bitnet_training_bytes(n, weight_bytes=4)
-        elif isinstance(module, nn.Linear) and not isinstance(module, DuobitLinear):
+        elif isinstance(module, nn.Linear) and not isinstance(module, DUOBIT_MODULES):
             n = module.weight.numel()
             n_linear += n
             linear_train += fp32_adam_training_bytes(n)

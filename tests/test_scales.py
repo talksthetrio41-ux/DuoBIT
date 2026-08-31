@@ -169,3 +169,74 @@ def test_training_state_accounts_for_the_trained_scales():
     # still far below FP32 Adam and a latent-weight (BitNet-style) optimizer
     assert with_scales["linear_train_bytes"] < 0.35 * with_scales["fp32_adam_linear_bytes"]
     assert with_scales["linear_bits_per_weight_train"] < 26.0
+
+
+def test_duobit_embedding_shares_the_linear_representation():
+    """A lookup table is another matrix: same codes+scales, no master weight."""
+    from duobit.layers import DUOBIT_MODULES, DuobitEmbedding
+
+    emb = DuobitEmbedding(512, 128, group_size=64)
+    assert isinstance(emb, DUOBIT_MODULES)
+    assert emb.codes.dtype == torch.uint8
+    assert sum(p.numel() for p in emb.parameters()) == 0, "no master weight"
+    assert torch.equal(emb.scales, emb.scales_init)
+
+    # nn.Embedding initialises N(0,1); the variance fit must preserve that
+    w = emb.get_dequantized_weight()
+    assert abs(float(w.std()) - 1.0) < 0.05
+
+    ids = torch.randint(0, 512, (3, 9))
+    assert torch.equal(emb(ids), nn.functional.embedding(ids, w))
+
+
+def test_duobit_embedding_trains_through_the_optimizer():
+    """Codes flip and scales move even though the row gradients are sparse."""
+    from duobit.layers import DuobitEmbedding
+
+    torch.manual_seed(0)
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb = DuobitEmbedding(256, 64, group_size=32)
+
+        def forward(self, x):
+            return self.emb(x)
+
+    model = M()
+    opt = DuobitAdam(model, lr=0.0, duobit_lr=4e-3, weight_decay=0.0,
+                     duobit_weight_decay=0.0, scale_update_freq=0,
+                     learn_scales=True, scale_lr=1e-2)
+    assert len(opt.duobit_layers) == 1, "the embedding must be on the discrete path"
+
+    codes0 = model.emb.codes.clone()
+    scales0 = model.emb.scales.clone()
+    for _ in range(40):
+        opt.zero_grad()
+        model(torch.randint(0, 256, (8, 16))).pow(2).mean().backward()
+        opt.step()
+
+    assert (model.emb.codes != codes0).any(), "no code ever transitioned"
+    assert not torch.allclose(model.emb.scales, scales0), "scales stayed frozen"
+
+
+def test_quantized_embeddings_shrink_the_reported_footprint():
+    """The embedding table dominates the footprint, so quantizing it must show."""
+    from duobit.layers import DuobitEmbedding
+    from duobit.quantization.memory import (
+        inference_memory_report,
+        training_memory_report,
+    )
+
+    vocab, dim = 4096, 128
+    dense = nn.Sequential(nn.Embedding(vocab, dim), DuobitLinear(dim, dim, group_size=64))
+    quant = nn.Sequential(DuobitEmbedding(vocab, dim, group_size=64),
+                          DuobitLinear(dim, dim, group_size=64))
+
+    d_inf = inference_memory_report(dense)["total_bytes"]
+    q_inf = inference_memory_report(quant)["total_bytes"]
+    d_tr = training_memory_report(dense, DuobitAdam(dense))["total_bytes"]
+    q_tr = training_memory_report(quant, DuobitAdam(quant))["total_bytes"]
+
+    assert q_inf < 0.25 * d_inf, f"inference {q_inf} vs {d_inf}"
+    assert q_tr < 0.45 * d_tr, f"training {q_tr} vs {d_tr}"

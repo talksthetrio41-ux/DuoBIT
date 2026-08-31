@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from duobit.config import DuobitConfig
-from duobit.layers.duobit_linear import DuobitLinear
+from duobit.layers import DUOBIT_MODULES
 from duobit.optim.duobit_adam import DuobitAdam
 from duobit.training.metrics import MetricTracker
 
@@ -80,7 +80,7 @@ class Trainer:
         else:
             ephemeral = []
             for m in self.model.modules():
-                if isinstance(m, DuobitLinear) and m.ephemeral_w is not None and m.ephemeral_w.grad is not None:
+                if isinstance(m, DUOBIT_MODULES) and m.ephemeral_w is not None and m.ephemeral_w.grad is not None:
                     ephemeral.append(m.ephemeral_w.grad)
             if ephemeral:
                 torch.nn.utils.clip_grad_norm_(ephemeral, max_norm=1.0)
