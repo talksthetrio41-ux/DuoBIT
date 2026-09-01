@@ -1,7 +1,7 @@
 # DUOBIT-EST: Architecture and Developer Guide
 
 **Author:** Pratyush Bhardwaj  
-**Version:** 2.0.0 (QPEFA + compressed Adam + trained group scales)
+**Version:** 3.0.0 (QPEFA + compressed Adam + trained group scales + 2-bit embedding table)
 
 Native 2-bit / ternary / binary pretraining **without master weights**. Linear maps persist as discrete codes $z$ and group scales $s$. The training residual is an integer QPEFA tensor. Adam $m$ is block-wise int8. Adam $v$ is factored ($O(m+n)$). The group scales are trained from their exact analytic gradient.
 
@@ -10,19 +10,38 @@ Native 2-bit / ternary / binary pretraining **without master weights**. Linear m
 FineWeb-EDU, 77.2M parameters, 3000 steps (49.2M tokens), 2x Tesla T4, identical
 data/seed/budget across runs:
 
-| | DUOBIT v2 | DUOBIT v1 | FP32 AdamW | FP16 AMP |
-|---|---|---|---|---|
-| val loss / PPL | **5.046 / 155.4** | 5.537 / 254.0 | **4.597 / 99.2** | 4.597 / 99.2 |
-| linear train bits/wt | 19.33 | 18.58 | 96.00 | 96.00 |
-| linear infer bits/wt | 2.25 | 2.25 | 32.00 | 16.00 |
-| train state / inference | 413 / 112 MiB | 409 / 112 | 883 / 294 | 883 / 196 |
-| throughput | 13,470 tok/s | 13,184 | 14,083 | 35,508 |
+| | DUOBIT v3 | DUOBIT v2 | DUOBIT v1 | FP32 AdamW | FP16 AMP |
+|---|---|---|---|---|---|
+| val loss / PPL (pooled) | **5.013 / 150.5** | 5.062 / 160.5 | 5.537 / 254.0 | **4.598 / 99.4** | 4.598 / 99.3 |
+| linear train bits/wt | **15.32** | 19.33 | 18.58 | 96.00 | 96.00 |
+| linear infer bits/wt | 2.25 | 2.25 | 2.25 | 32.00 | 16.00 |
+| FP32 params remaining | **8,704** | 25.7M | 25.7M | 77.2M | 77.2M |
+| train state / inference | **141 / 20.7 MiB** | 413 / 112 | 409 / 112 | 883 / 294 | 883 / 196 |
+| throughput | 14,167 tok/s | 14,131 | 13,184 | 14,654 | 34,939 |
 
-Tuning moved DuoBIT 0.49 nats and closed 52% of the gap to FP32; it is closer,
-not equal. DuoBIT buys memory (4.97x training state, 14.2x inference storage on
-the linear maps), not speed -- FP16 AMP matches FP32 quality at 2.5x the
-throughput. Full results and caveats: `docs/fineweb_v2_results.md`, ablation:
-`docs/fineweb_v2_ablation.md`.
+v3 quantizes the token embedding table, which was 71% of training state and 88%
+of the inference footprint. **6.26x** less training state and **14.2x** less
+inference storage than FP32, whole-model, with 0.011% of parameters left in
+FP32. Quality is **neutral vs v2** (+0.049 nats, ~1.5σ, not resolved) and still
+**0.415 nats behind FP32**. DuoBIT buys memory, not speed -- FP16 AMP matches
+FP32 quality at 2.4x the throughput. Results: `docs/fineweb_v3_results.md`,
+ablation: `docs/fineweb_v3_ablation.md`.
+
+## Run-to-run variance (read before trusting any single number)
+
+The discrete path does **not** reproduce across runs, even with a fixed seed.
+Seven runs of one configuration at the 500-step sweep scale: mean 6.1164, std
+0.0473, **range 0.131 nats** -- two of them byte-identical in the same session,
+0.097 apart. At 77M/3000 steps the replicate spread is 0.059. FP32 over the
+same sessions spans 0.004.
+
+A code transition is a step function of the accumulated QPEFA residual, so a
+perturbation far below FP32 rounding decides whether a weight flips, and GPU
+reduction order is not deterministic across runs. Fixing the seed fixes the
+stochastic-rounding hash, not the arithmetic feeding it. **Do not report an
+effect below ~0.13 nats (500 steps) or ~0.06 (3000 steps) from single runs;
+replicate and pool.** Two rows of the v2 ablation failed this test and are
+marked unresolved.
 
 ## What changed in v2 (read this first)
 

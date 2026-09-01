@@ -281,11 +281,37 @@ sizes -- so most rows see a long run of exactly zero updates punctuated by
 occasional ones. This is the regime QPEFA was built for: the residual holds a
 row's accumulated sub-threshold movement indefinitely and flips its codes only
 when the accumulation crosses a Voronoi boundary, so a rare token's updates are
-neither discarded nor amplified. Note that the factored second moment is a
-weaker fit here than for a dense matrix, since its row statistic decays toward
-zero for tokens that have not appeared recently; the first moment decays faster
+neither discarded nor amplified. The factored second moment is a weaker fit
+here than for a dense matrix, since its row statistic decays toward zero for
+tokens that have not appeared recently; the first moment decays faster
 ($\beta_1^k$ against $\beta_2^{k/2}$), so stale rows take smaller steps rather
-than exploding ones.
+than exploding ones. Simulated against a full per-element $v$ under Zipf token
+visits, the resulting update direction holds at cosine $0.990$ (against
+$0.9988$ for dense gradients), with the error systematic in token frequency
+(0.06 on the most frequent decile of rows, 0.19 on the rarest). The
+approximation degrades measurably but not enough to motivate an $O(mn)$ second
+moment for the table.
+
+**Measured effect.** At 49.2M parameters and 500 steps, quantizing the table is
+worth $+0.157$ nats against a pooled seven-run dense baseline ($3.1\sigma$), and
+three controls exclude the obvious confound -- the quantized table trains at
+$\eta_d$ without decay while a dense one trains at $\eta$ with decay, and giving
+the dense table either or both leaves it on the baseline. At 77.2M parameters
+and 3000 steps the same comparison is $+0.049$ nats ($\approx 1.5\sigma$, not
+resolved). The horizon-dependence is what a regularisation account predicts: a
+2-bit row cannot memorise a token seen a handful of times, and that constraint
+matters less as the token budget grows. The compression, which is exact
+accounting rather than a measurement, does not depend on the horizon: at 77.2M
+parameters it leaves $8{,}704$ of $77{,}161{,}984$ parameters in FP32 and takes
+the whole-model inference footprint from 294.3 MiB to 20.7 MiB.
+
+A caution that applies to every number in this paper obtained from a single
+run: the discrete path does not reproduce. Seven runs of one configuration span
+0.131 nats at the 500-step scale (two byte-identical runs in one session differ
+by 0.097) while an FP32 baseline spans 0.004 across the same sessions. A
+transition is a step function of the accumulated residual, so a perturbation far
+below FP32 rounding decides whether a weight flips; seeding fixes the
+stochastic-rounding hash, not the GPU reduction order feeding it.
 
 ### 3.10 Memory accounting
 
