@@ -182,6 +182,15 @@ def build_argparser() -> argparse.ArgumentParser:
     # optimization
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--wd", type=float, default=1e-2)
+    p.add_argument("--embed-lr", type=float, default=0.0,
+                   help="separate LR for a dense (unquantized) embedding table; "
+                        "0 uses --lr. Exists so that the FP32-embedding baseline "
+                        "can be given the same rate the quantized path trains at "
+                        "(--duobit-lr), which is otherwise a confound when "
+                        "comparing --quant-embeddings 0 against 1.")
+    p.add_argument("--embed-wd", type=float, default=-1.0,
+                   help="separate weight decay for a dense embedding table; "
+                        "negative uses --wd.")
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--amp", type=int, default=0, choices=[0, 1],
                    help="run this mode under torch.autocast(float16); the fp16 "
@@ -1380,7 +1389,20 @@ class DuobitAdam:
         self.duobit_layers = [m for m in model.modules()
                               if isinstance(m, DUOBIT_MODULES)]
         self.params = [p for p in model.parameters() if p.requires_grad]
+        # A dense embedding table may take its own rate and decay. Without this
+        # the FP32-embedding baseline trains at --lr while the quantized table
+        # trains at --duobit-lr, so "quantizing the embeddings helped" would be
+        # confounded with a 4x learning-rate change.
+        self.embed_param_ids = {
+            id(m.weight) for m in model.modules()
+            if isinstance(m, nn.Embedding) and m.weight.requires_grad}
         self.lr = args.lr
+        # held as a ratio to --lr so the warmup/decay schedule, which only
+        # rescales self.lr, carries through to the embedding rate unchanged
+        _elr = float(getattr(args, "embed_lr", 0.0) or 0.0)
+        self.embed_lr_ratio = (_elr / args.lr) if _elr > 0 and args.lr > 0 else 1.0
+        _ewd = float(getattr(args, "embed_wd", -1.0))
+        self.embed_wd = _ewd if _ewd >= 0 else None
         self.duobit_lr = args.duobit_lr
         self.scale_lr = float(getattr(args, "scale_lr", 1e-3))
         self.b1, self.b2 = 0.9, 0.999
@@ -1454,10 +1476,14 @@ class DuobitAdam:
 
     # -- internals ----------------------------------------------------------
     def _step_standard_params(self):
-        lr, b1, b2, eps, wd = self.lr, self.b1, self.b2, self.eps, self.wd
+        b1, b2, eps = self.b1, self.b2, self.eps
         for p in self.params:
             if p.grad is None:
                 continue
+            is_embed = id(p) in self.embed_param_ids
+            lr = self.lr * self.embed_lr_ratio if is_embed else self.lr
+            wd = (self.embed_wd if (is_embed and self.embed_wd is not None)
+                  else self.wd)
             st = self.pstate.get(id(p))
             if st is None:
                 st = {"m": torch.zeros_like(p.data), "v": torch.zeros_like(p.data), "t": 0}
