@@ -116,9 +116,17 @@ to the v2 one at all.
 - **The scale-relative discrete LR did not help** at either scale tested, and
   the final configuration keeps the absolute rate despite the relative
   parametrisation being the more principled one.
-- **Single seed per configuration.** Run-to-run variance is not measured; the
-  0.024-nat weight-decay effect in the ablation is within what a second seed
-  could plausibly move, though the 0.49-nat headline is far outside it.
+- **Single seed per configuration, and the variance was later measured and is
+  large.** Seven runs of one DuoBIT configuration at the 500-step sweep scale
+  gave mean 6.1164, std 0.0473, range 0.1310 nats — including two runs in the
+  *same session* with byte-identical config and seed that differed by 0.097.
+  The FP32 baseline reproduces across sessions to 0.004 nats, so this is
+  specific to the discrete path: a code transition is a step function of the
+  accumulated residual, so a perturbation far below FP32 rounding decides
+  whether a weight flips. The 0.49-nat v1 -> v2 headline is far outside that
+  band; the finer ablation rows are not, and are annotated accordingly in
+  [`fineweb_v2_ablation.md`](fineweb_v2_ablation.md). The variance at this
+  3000-step scale is measured in the v3 run rather than assumed equal.
 - **A memory-accounting bug in this harness was found and fixed after the runs.**
   The dense baselines charged their linear weights twice (once as linear maps,
   once as parameters), inflating only the FP32/FP16 memory columns. The DuoBIT

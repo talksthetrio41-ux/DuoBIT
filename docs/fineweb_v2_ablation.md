@@ -31,6 +31,32 @@ Raw artifacts: [`results/fineweb-v2-ablation/`](../results/fineweb-v2-ablation/)
 
 `A6`/`A7` branch from `A4`; `A8`/`A9` branch from `A4` with `scale_lr` 1e-2.
 
+## The noise floor, measured afterwards
+
+> **Read this table before the one above.** A later sweep ran the `A8`
+> configuration seven times — twice inside a single session, byte-identical
+> config and seed — and it does not reproduce:
+>
+> | measurement | val loss |
+> |---|---|
+> | `A8` (this sweep) | 6.0731 |
+> | `C0-base` (sweep C) | 6.1578 |
+> | `D0-base` (sweep D) | 6.0977 |
+> | `D0b-base-rep` (sweep D, same session as `D0`) | 6.1942 |
+> | `D2`/`D3`/`D4` (dense-embedding controls) | 6.0632 / 6.0971 / 6.1315 |
+>
+> **mean 6.1164, std 0.0473, range 0.1310 nats.** The same FP32 baseline
+> reproduces across sessions to 0.004 nats, so this is a property of the
+> discrete path, not of the harness: a code transition is a step function of
+> the accumulated residual, so a difference far below FP32 rounding decides
+> whether a weight flips, and the flip is not small. Fixing the seed does not
+> remove it, because GPU reduction order is not fixed.
+>
+> Consequently **any row-to-row difference below ~0.13 nats in the ablation
+> above is not resolved by a single run**, and the "what each correction was
+> worth" figures below are point estimates from one sample each. The
+> annotations mark which survive.
+
 ## Validation trajectory
 
 | run | @125 | @250 | @375 | @500 |
@@ -42,36 +68,50 @@ Raw artifacts: [`results/fineweb-v2-ablation/`](../results/fineweb-v2-ablation/)
 | `A7-rellr1.0` | 7.8655 | 7.2280 | 6.8993 | 6.6869 |
 
 No ordering changes over the last three checkpoints, so the ranking is not an
-artifact of where the runs were cut.
+artifact of where the runs were cut. It can still be an artifact of which
+sample each configuration drew — see the noise floor above; the ordering is
+trustworthy for the gaps wider than ~0.13 nats and not for the narrower ones.
 
 ## What each correction was worth
 
-- **Variance-preserving init: 0.215 nats**, the single largest effect and the
-  cheapest — it is a different closed-form scale at step 0 and costs nothing at
-  runtime. The MSE fit shrinks the weight std to 0.956x at every fan-in, which
-  compounds over the 12 linear maps of this model.
-- **QPEFA clip 4.0 -> 1.0: 0.041 nats.** Smaller than the init fix but free: the
-  accumulator only ever reaches ~0.333 s after quantization, so the wide clip
-  was spending most of the int8 residual grid on unreachable values.
-- **Trained scales: 0.104 nats at `scale_lr` 3e-2**, and roughly neutral at
-  1e-2 over 500 steps (the scales move ~4% net, `s/s0` 0.951-0.959). This is the
-  correction that removes a structural limitation rather than a tuning error, so
-  its value should grow with the horizon; at 500 steps it is not yet the biggest
-  term.
-- **Weight decay on the discrete path: neutral** here (-0.024 nats, within
-  run-to-run noise). Kept at 0 because decaying `W_hat` when the magnitude lives
-  in `s_g` has no principled meaning, not because it measurably hurt.
-- **Discrete learning rate: 0.175 nats** from 8e-3 to 4e-3, with 2e-2 much
-  worse. The scan is monotone at its lower edge, so 4e-3 is the best *measured*
-  value, not a located optimum — there is likely more here.
-- **Scale-relative discrete LR: did not help.** 0.3 is roughly the absolute
-  8e-3 equivalent at this fan-in and lost 0.16 nats against it. The
-  reparametrisation is defensible in principle (it makes one rate commensurate
-  with the codebook gap across layers) but it is not what this model wanted, so
-  the final configuration keeps the absolute rate.
+Each figure is a difference of two single runs, so read it against the
+0.131-nat noise band above. Three survive it; two do not.
 
-Net: **6.4814 -> 6.0731, a 0.408-nat improvement**, and the gap to the FP32
-baseline narrows from +0.587 to +0.178 nats — 70% of it closed.
+- **Variance-preserving init: 0.215 nats — resolved.** The single largest
+  effect and the cheapest: it is a different closed-form scale at step 0 and
+  costs nothing at runtime. The MSE fit shrinks the weight std to 0.956x at
+  every fan-in, which compounds over the 12 linear maps of this model.
+- **QPEFA clip 4.0 -> 1.0: 0.041 nats — *not resolved*.** Well inside the noise
+  band; this sweep cannot say whether it helped, hurt, or did nothing. It is
+  kept on the analytic argument alone — the accumulator only ever reaches
+  ~0.333 s after quantization, so the wide clip spends most of the int8
+  residual grid on unreachable values — and that argument is about the
+  representation, not about this measurement.
+- **Trained scales: 0.104 nats at `scale_lr` 3e-2 — marginal**, roughly 2x the
+  per-run standard deviation and below the observed range. Neutral at 1e-2 over
+  500 steps (the scales move ~4% net, `s/s0` 0.951-0.959). The correction
+  removes a structural limitation rather than a tuning error, so its value
+  should grow with the horizon — and at 3000 steps `s/s0` reaches 0.824 against
+  exactly 1.000 for v1, which is direct evidence the mechanism engages even
+  where the 500-step loss difference does not resolve.
+- **Weight decay on the discrete path: not resolved** (-0.024 nats). Kept at 0
+  because decaying `W_hat` when the magnitude lives in `s_g` has no principled
+  meaning, not because it measurably hurt.
+- **Discrete learning rate: 0.175 nats — resolved**, from 8e-3 to 4e-3, with
+  2e-2 much worse (0.48 nats). The scan is monotone at its lower edge, so 4e-3
+  is the best *measured* value, not a located optimum. A later sweep took it
+  lower (2e-3, 1e-3) and found no further gain outside the noise band.
+- **Scale-relative discrete LR: did not help — resolved.** 0.3 is roughly the
+  absolute 8e-3 equivalent at this fan-in and lost 0.16 nats against it, and
+  1.0 lost 0.44. The reparametrisation is defensible in principle (it makes one
+  rate commensurate with the codebook gap across layers) but it is not what
+  this model wanted, so the final configuration keeps the absolute rate.
+
+Net: **6.4814 -> 6.0731, a 0.408-nat improvement** — three times the noise band
+— and the gap to the FP32 baseline narrows from +0.587 to +0.178 nats. Against
+the pooled seven-run mean for this configuration (6.1164) the improvement is
+0.365 nats and the residual gap +0.222; those are the figures to quote, since
+`A8`'s own 6.0731 is the low end of its sampling distribution.
 
 ## Cost and correctness
 
